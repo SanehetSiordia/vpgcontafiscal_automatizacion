@@ -54,6 +54,7 @@ cover/
 # Translations
 *.mo
 *.pot
+prompt.md
 
 # Django stuff:
 *.log
@@ -216,3 +217,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# VPG Contadores - Vault
+.env.*
+!.env.example
+.vault-token
+*.unseal
+vault-init*.txt

@@ -1,0 +1,2 @@
+# Sin dependencias de Python: el servicio vault-service usa unicamente
+# la imagen oficial hashicorp/vault:2.1.1 y su CLI incluida.
