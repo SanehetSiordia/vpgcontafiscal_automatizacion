@@ -6,17 +6,20 @@ ARG VAULT_VERSION=2.1.1
 FROM hashicorp/vault:${VAULT_VERSION} AS vault-assets
 USER root
 COPY config/vault.hcl /staging/vault/config/vault.hcl
+COPY config/policies/ /staging/vault/config/policies/
 COPY docker-entrypoint.sh /staging/usr/local/bin/vpg-entrypoint.sh
-RUN sed -i 's/\r$//' /staging/vault/config/vault.hcl /staging/usr/local/bin/vpg-entrypoint.sh \
- && chmod 0640 /staging/vault/config/vault.hcl \
- && chmod 0755 /staging/usr/local/bin/vpg-entrypoint.sh \
+COPY scripts/vault-auth-bootstrap.sh /staging/usr/local/bin/vpg-auth-bootstrap
+RUN sed -i 's/\r$//' /staging/vault/config/vault.hcl /staging/vault/config/policies/*.hcl \
+      /staging/usr/local/bin/vpg-entrypoint.sh /staging/usr/local/bin/vpg-auth-bootstrap \
+ && chmod 0640 /staging/vault/config/vault.hcl /staging/vault/config/policies/*.hcl \
+ && chmod 0755 /staging/usr/local/bin/vpg-entrypoint.sh /staging/usr/local/bin/vpg-auth-bootstrap \
  && mkdir -p /staging/vault/data \
  && chmod 0700 /staging/vault/data
 
 # Etapa final: servidor Vault (sin modo dev), usuario no root.
 FROM hashicorp/vault:${VAULT_VERSION} AS vault-server
 COPY --from=vault-assets --chown=vault:vault /staging/vault/ /vault/
-COPY --from=vault-assets /staging/usr/local/bin/vpg-entrypoint.sh /usr/local/bin/vpg-entrypoint.sh
+COPY --from=vault-assets /staging/usr/local/bin/ /usr/local/bin/
 ENV VAULT_ADDR=http://127.0.0.1:8200
 USER vault
 EXPOSE 8200
