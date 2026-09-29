@@ -155,16 +155,16 @@ así no aparece en el historial ni en los argumentos del comando.
 ```bash
 read -rsp 'Password: ' VPG_PASS; echo
 printf '%s' "$VPG_PASS" | docker compose exec -T vault-service \
-  vault kv put -mount=secret crawler/ejemplo usuario=__Fulanito__ password=-
+  vault kv put -mount=secret sat/usuarios usuario=__Fulanito__ password=-
 unset VPG_PASS
 ```
 
 ### 7. Recuperar cada valor
 
 ```bash
-docker compose exec vault-service vault kv get -mount=secret -field=usuario crawler/ejemplo
-docker compose exec vault-service vault kv get -mount=secret -field=password crawler/ejemplo
-docker compose exec vault-service vault kv metadata get -mount=secret crawler/ejemplo   # versiones
+docker compose exec vault-service vault kv get -mount=secret -field=usuario sat/usuarios
+docker compose exec vault-service vault kv get -mount=secret -field=password sat/usuarios
+docker compose exec vault-service vault kv metadata get -mount=secret sat/usuarios   # versiones
 ```
 
 ### 8. Logs, reinicio y parada
@@ -204,7 +204,7 @@ docker compose down
 docker compose up -d
 docker compose exec vault-service vault operator unseal
 docker compose exec vault-service vault login -no-print
-docker compose exec vault-service vault kv get -mount=secret -field=usuario crawler/ejemplo
+docker compose exec vault-service vault kv get -mount=secret -field=usuario sat/usuarios
 MSYS_NO_PATHCONV=1 docker compose exec vault-service ls -la /vault/data
 ```
 
