@@ -139,6 +139,13 @@ Una vez comprobado el acceso como administrador, revoca el root token
 (`vault token revoke -self`) y quita `VAULT_INITIAL_TOKEN` de `.env`; si lo
 necesitas de nuevo, genera uno con `vault operator generate-root`.
 
+
+Verificar Codigo MFA esperado para ingresar con username
+
+```bash
+python -c "import base64,hmac,hashlib,struct,time;k=base64.b32decode('SECRET_GENERADO');h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest();o=h[-1]&15;print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))"
+```
+
 ### 6. Guardar credenciales de ejemplo
 
 Valores de ejemplo: usuario `__Fulanito__`, password `__MyS3cret0__`; sustitúyelos
