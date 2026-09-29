@@ -1,0 +1,35 @@
+name: vpg-contadores
+
+services:
+  vault-service:
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: vault-server
+      args:
+        VAULT_VERSION: ${VAULT_VERSION}
+    image: vpg/vault-server:${VAULT_VERSION}
+    container_name: ${VAULT_CONTAINER_NAME}
+    hostname: vault-service
+    restart: unless-stopped
+    environment:
+      VAULT_LOG_LEVEL: ${VAULT_LOG_LEVEL}
+    ports:
+      - "${VAULT_PORT_LOCAL}:${VAULT_PORT_REMOTE}"
+    volumes:
+      - vault-data:/vault/data
+    networks:
+      - ${DOCKER_NETWORK_NAME}
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  vault-data:
+    name: ${VAULT_VOLUME_NAME}
+
+networks:
+  network-service:
+    name: ${DOCKER_NETWORK_NAME}
+    driver: bridge

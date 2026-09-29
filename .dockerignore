@@ -1,0 +1,9 @@
+# Contexto mínimo: solo lo que el Dockerfile copia.
+**
+!config/vault.hcl
+!docker-entrypoint.sh
+
+# Explícito, aunque ya queda excluido por la regla anterior.
+.env
+.env.*
+.git

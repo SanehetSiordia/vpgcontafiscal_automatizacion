@@ -217,3 +217,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# VPG Contadores - Vault
+.env.*
+!.env.example
+.vault-token
+*.unseal
+vault-init*.txt
