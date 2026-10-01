@@ -1,0 +1,8 @@
+# Sin dependencias de Python: el servicio postgres-service usa unicamente la
+# imagen oficial postgres:17-alpine, su entrypoint y los clientes psql /
+# pg_isready que ya incluye.
+#
+# Este archivo se mantiene VACIO de paquetes a proposito: instalar Python o
+# librerias dentro del contenedor de la base de datos ampliaria su superficie
+# de ataque sin necesidad. Las dependencias del futuro backend iran en su
+# propio archivo de requirements, en su propia imagen.

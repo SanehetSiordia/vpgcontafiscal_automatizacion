@@ -25,11 +25,66 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  postgres-service:
+    # Sin env_file a proposito: asi las variables VAULT_* (incluida
+    # VAULT_ADMIN_USER_PASS) no entran en el entorno del contenedor de la base
+    # de datos. Solo se declara lo que PostgreSQL necesita.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: postgres-server
+      args:
+        POSTGRES_VERSION: ${POSTGRES_VERSION}
+    image: vpg/postgres-server:${POSTGRES_VERSION}
+    container_name: ${POSTGRES_CONTAINER_NAME}
+    hostname: postgres-service
+    restart: unless-stopped
+    environment:
+      # Parametros NO sensibles (vienen de .env).
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA}
+      # Contrasenas: SOLO por archivo de secreto, nunca como valor en .env.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_APP_PASSWORD_FILE: /run/secrets/postgres_app_password
+    secrets:
+      - postgres_password
+      - postgres_app_password
+    ports:
+      # Publicado solo en la interfaz de loopback del host.
+      - "${POSTGRES_HOST_BIND}:${POSTGRES_PORT_LOCAL}:${POSTGRES_PORT_REMOTE}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - ${DOCKER_NETWORK_NAME}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # pg_isready contra el socket local, con el usuario y la base reales.
+      test: ["CMD-SHELL", "pg_isready --quiet --username=\"$${POSTGRES_USER}\" --dbname=\"$${POSTGRES_DB}\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
 volumes:
   vault-data:
     name: ${VAULT_VOLUME_NAME}
+  postgres-data:
+    name: ${POSTGRES_VOLUME_NAME}
 
 networks:
   network-service:
     name: ${DOCKER_NETWORK_NAME}
     driver: bridge
+
+secrets:
+  # Archivos generados por scripts/postgres/prepare-secrets.sh.
+  # Se montan en /run/secrets/<nombre> dentro del contenedor y estan excluidos
+  # del repositorio (.gitignore) y del contexto de build (.dockerignore).
+  postgres_password:
+    file: ./secrets/postgres_password
+  postgres_app_password:
+    file: ./secrets/postgres_app_password

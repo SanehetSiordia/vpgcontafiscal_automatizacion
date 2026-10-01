@@ -4,8 +4,13 @@
 !config/policies/*.hcl
 !docker-entrypoint.sh
 !scripts/vault-auth-bootstrap.sh
+!sql/001_employees.sql
+!scripts/postgres/pg-schema.sh
+!scripts/postgres/pg-app-role.sh
 
 # Explícito, aunque ya queda excluido por la regla anterior.
 .env
 .env.*
 .git
+secrets/
+secrets/**
