@@ -224,3 +224,6 @@ __marimo__/
 .vault-token
 *.unseal
 vault-init*.txt
+
+#entorno visual Code
+.vscode/
