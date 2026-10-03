@@ -3,11 +3,11 @@ Automatizacion Inteligente para contabilidad fiscal VPG
 
 | Componente | Estado | Servicio |
 |---|---|---|
-| [1. HashiCorp Vault](#componente-1-hashicorp-vault-credenciales-del-crawler) | listo | `vault-service` |
+| [1. HashiCorp Vault](#componente-1-hashicorp-vault-credenciales) | listo | `vault-service` |
 | [2. PostgreSQL 17](#componente-2-postgresql-17-empleados-roles-y-vínculo-con-vault) | listo | `postgres-service` |
 | 3. Backend / frontend | **no implementado en esta etapa** | — |
 
-## Componente 1: HashiCorp Vault (credenciales del crawler)
+## Componente 1: HashiCorp Vault (credenciales del servicio)
 
 Vault 2.1.1 en modo servidor (no dev), almacenamiento integrado Raft en un
 volumen Docker y motor de secretos KV v2. El puerto 8200 se publica solo en
@@ -97,7 +97,7 @@ Qué configura:
 
 | Elemento | Detalle |
 |---|---|
-| Políticas | `vpg-admin` (acceso total) y `vpg-oidc-user` (lectura de `secret/crawler/*`) |
+| Políticas | `vpg-admin` (acceso total) y `vpg-oidc-user` (lectura de `secret/sat/*`) |
 | `auth/userpass` | Usuario `VAULT_ADMIN_USER_NAME` (en minúsculas) con contraseña inicial `VAULT_ADMIN_USER_PASS` y política `vpg-admin`. Si el usuario ya existe **no** se sobrescribe la contraseña |
 | MFA de login | Método TOTP `vpg-totp` (SHA1, 6 dígitos, 30 s) **obligatorio** en todo login por userpass |
 | `auth/oidc` | Solo si `.env` define `VAULT_OIDC_DISCOVERY_URL`, `VAULT_OIDC_CLIENT_ID` y `VAULT_OIDC_CLIENT_SECRET`; rol `default` con `VAULT_OIDC_USER_CLAIM`, `VAULT_OIDC_SCOPES` y `VAULT_OIDC_POLICIES` |
@@ -132,6 +132,11 @@ Cambiar la contraseña inicial tras el primer login (recomendado):
 ```bash
 docker compose exec vault-service vault write auth/userpass/users/usuarioadmin password=-
 ```
+Verificar Codigo MFA esperado para ingresar con username
+
+```bash
+python -c "import base64,hmac,hashlib,struct,time;k=base64.b32decode('SECRET_GENERADO');h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest();o=h[-1]&15;print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))"
+```
 
 **OIDC:** registra en tu proveedor (Entra ID, Google, Keycloak, Okta…) una
 aplicación web con redirect URI
@@ -144,13 +149,6 @@ rol `default`); el MFA de los usuarios OIDC lo aplica el proveedor.
 Una vez comprobado el acceso como administrador, revoca el root token
 (`vault token revoke -self`) y quita `VAULT_INITIAL_TOKEN` de `.env`; si lo
 necesitas de nuevo, genera uno con `vault operator generate-root`.
-
-
-Verificar Codigo MFA esperado para ingresar con username
-
-```bash
-python -c "import base64,hmac,hashlib,struct,time;k=base64.b32decode('SECRET_GENERADO');h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest();o=h[-1]&15;print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))"
-```
 
 ### 6. Guardar credenciales de ejemplo
 
@@ -375,7 +373,7 @@ implementado**:
 | Rol de aplicación | Política de Vault prevista | Alcance previsto |
 |---|---|---|
 | `admin` | `vpg-admin` (existe) | Administración de Vault |
-| `manager` | `vpg-crawler-operator` (**pendiente**) | Lectura/escritura de `secret/data/crawler/*` |
+| `manager` | `vpg-operator` (**pendiente**) | Lectura/escritura de `secret/sat/*` |
 | `employee` | `vpg-employee-self` (**pendiente**) | Sin acceso a `secret/*`, o solo a su propia ruta |
 
 ### Vinculación con Vault y MFA TOTP: quién hace qué
@@ -431,8 +429,8 @@ Todas se ejecutan desde la raíz del repositorio. Las marcadas
 > `docker compose up` falla con
 > `ports are not available: ... bind: An attempt was made to access a socket in a way forbidden by its access permissions`.
 > Compruébalo con `netstat -ano | grep 5432` y cambia `POSTGRES_PORT_LOCAL` en
-> `.env` (p. ej. a `5433`). Las comprobaciones de abajo se ejecutaron con
-> `5433` por esa razón.
+> `.env` (p. ej. a `5434`). Las comprobaciones de abajo se ejecutaron con
+> `5434` por esa razón.
 
 ### 1. Preparar secretos, validar la configuración y arrancar
 
@@ -478,7 +476,7 @@ contenedores:{{range .Containers}}
 
 ```
 NAME           SERVICE            STATUS                   PORTS
-vpg-postgres   postgres-service   Up (healthy)             127.0.0.1:5433->5432/tcp
+vpg-postgres   postgres-service   Up (healthy)             127.0.0.1:5434->5432/tcp
 vpg-vault      vault-service      Up (healthy)             0.0.0.0:8200->8200/tcp
 
 network-service driver=bridge subnet=172.18.0.0/16
@@ -536,7 +534,7 @@ unset APPPW
 1|172.18.0.3
 ```
 
-Desde PowerShell, `Test-NetConnection -ComputerName 127.0.0.1 -Port 5433 -InformationLevel Quiet`
+Desde PowerShell, `Test-NetConnection -ComputerName 127.0.0.1 -Port 5434 -InformationLevel Quiet`
 devolvió `True`.
 
 ### 5. Inspeccionar tablas, restricciones e índices
@@ -776,7 +774,45 @@ no se guarda en PostgreSQL. El código TOTP **se pide por teclado** (entrada
 oculta) y hay que leerlo de la app autenticadora.
 
 ```bash
+# a) diagnóstico de solo lectura: relojes, método TOTP, enforcement y vínculo.
+#    NO pide código y NO gasta ninguno de los 5 intentos.
+bash scripts/postgres/verify-vault-mfa.sh --diagnose
+
+# b) verificación completa (pide el código por teclado)
 bash scripts/postgres/verify-vault-mfa.sh
+```
+
+Antes de pedir el código, el script espera si a la ventana TOTP actual le quedan
+menos de 8 s, y después informa de cuántos segundos tardaste en teclear: así se
+descarta que el código caducara mientras lo escribías.
+
+**El prompt muestra un `#` por cada dígito tecleado.** `read -rs` a secas no da
+ninguna señal visual y es imposible distinguir «el teclado no responde» de «el
+script está colgado»:
+
+```
+    Escribe los 6 digitos. Veras un '#' por cada uno, para confirmar que
+    el teclado se esta registrando. Borrar: retroceso. Cancelar: Ctrl+C.
+    Al llegar al sexto digito se envia solo (no hace falta pulsar Enter).
+
+Codigo TOTP para sinhuesiordia: ######  [6/6 digitos]
+==> Validando con Vault (userpass + TOTP)...
+```
+
+- **Autoenvío al sexto dígito**: no hay que pulsar Enter. En consecuencia, el
+  retroceso solo corrige **antes** de completar los 6.
+- Las teclas no numéricas se ignoran; el retroceso (`DEL` o `^H`) borra el
+  último dígito.
+- Si pulsas Enter con menos de 6 dígitos, el script lo rechaza **sin intentar el
+  login**: no gasta ningún intento.
+- Hay un límite de 180 s; si expira, se cancela sin consumir intentos.
+- El script corre con `set -Eeuo pipefail` y un `trap ... ERR` que imprime línea,
+  código de salida y orden fallida: **ningún fallo lo cierra en silencio**.
+
+Si aun así el prompt no reacciona a las teclas, es cosa del terminal; prueba:
+
+```bash
+winpty bash scripts/postgres/verify-vault-mfa.sh
 ```
 
 Flujo: (1) `auth/userpass/login/<usuario>` solo con contraseña — Vault responde
@@ -807,32 +843,124 @@ totp_confirmed_at | <fecha del login>
 last_mfa_login_at | <fecha del login>
 ```
 
-**Estado de esta comprobación: PARCIALMENTE VERIFICADA.**
+**Estado de esta comprobación: VERIFICADA, salvo la escritura en PostgreSQL.**
 
-Verificado de verdad contra la instancia en ejecución:
+Rechazos, comprobados contra la instancia en ejecución:
 
 ```
 MFA_ENFORCED=si
 MFA_PASSWORD_ONLY_TOKEN=ninguno        <- con solo contraseña Vault NO emite token
 MFA_METHOD_ID=4b2ddbcb-fe31-b4fb-d430-12c4e6d86515   <- coincide con vault_auth_config
-MFA_LOGIN=totp_rechazado  (con un código 000000 deliberadamente inválido)
-MFA_ERROR=Code: 403 ... failed to satisfy enforcement vpg-userpass-totp.
-          error: * failed to validate TOTP passcode
-                 * login MFA validation failed for methodID: [4b2ddbcb-...]
+MFA_LOGIN=totp_incorrecto  (con un código 000000 deliberadamente inválido)
+   failed to satisfy enforcement vpg-userpass-totp. error: 2 errors occurred:
+   failed to validate TOTP passcode
+   login MFA validation failed for methodID: [4b2ddbcb-...]
 
 (con contraseña incorrecta) MFA_LOGIN=credenciales_invalidas   <- no llega al TOTP
 ```
 
-**Pendiente:** el login con un código TOTP **válido** y, por tanto, el paso de
-`totp_status` a `confirmed`. Requiere el código de la app autenticadora del
-titular, que no está disponible de forma automatizada (y no debe estarlo). El
-valor actual en la base de datos es `totp_status = pending`,
-`last_mfa_login_at = NULL`: **no se ha inventado ningún resultado**.
+Login correcto, con un código TOTP real tecleado por el titular (2026-10-02):
+
+```
+Codigo TOTP para sinhuesiordia: ######  [6/6 digitos]
+==> Validando con Vault (userpass + TOTP)...
+
+    MFA exigido por Vault ....: si
+    Token con solo contrasena : ninguno
+    Login MFA ................: ok           <- userpass + TOTP aceptado
+    token revocado al final ..: si
+```
+
+**Pendiente:** el paso de `totp_status` a `confirmed`. En esa misma ejecución el
+script no pudo leer el `entity_id` de la sesión por un fallo propio —usaba
+`vault token lookup -field=...`, que esta versión de Vault rechaza con
+`flag provided but not defined: -field`— y, al no tener con qué comparar, **no
+confirmó nada**. Ya está corregido (`vault read -field=entity_id
+auth/token/lookup-self`, comprobado: devuelve `cdaf589c-…`). El valor en la base
+de datos sigue siendo `totp_status = pending`, `last_mfa_login_at = NULL`:
+**no se ha inventado ningún resultado**. Basta repetir el paso 10.
 
 > ⚠️ El método TOTP tiene `max_validation_attempts=5`. Varios intentos
-> fallidos seguidos bloquean la validación de esa entidad durante un rato. Si
-> ocurre, espera y vuelve a intentarlo; para regenerar la semilla:
-> `docker compose exec vault-service vpg-auth-bootstrap --reset-totp`.
+> fallidos seguidos bloquean la validación de esa entidad durante un rato. Usa
+> `--diagnose` mientras esperas: no consume intentos.
+
+#### Si el código TOTP es rechazado
+
+El script distingue los casos y los imprime en un bloque `ESTADO: ...` con la
+respuesta **literal** de Vault debajo. No se oculta ningún error y el vínculo en
+PostgreSQL **no se modifica** en ninguno de ellos.
+
+| `ESTADO` | Qué significa | Qué hacer |
+|---|---|---|
+| `TOTP INCORRECTO` | La contraseña era correcta (Vault llegó a pedir el segundo factor) pero el código no coincide | Entrada obsoleta en la app, hora del teléfono, o código caducado al teclear. Ver abajo |
+| `TOTP BLOQUEADO` | Se agotaron los 5 intentos consecutivos | Esperar lo que indique Vault y reintentar **una** vez con un código recién generado |
+| `SIN SEMILLA TOTP` | La entidad no tiene secreto generado | `docker compose exec vault-service vpg-auth-bootstrap` |
+| `PETICIÓN MFA CADUCADA` | Expiró el `mfa_request_id` entre el login y la validación | Repetir sin pausas |
+| `CONTRASEÑA INCORRECTA` | Falló antes del segundo factor; **no** se gastó ningún intento de TOTP | `VAULT_ADMIN_USER_PASS` en `.env` no es la contraseña actual de userpass |
+| `FALLO DE SEGURIDAD` | Vault emitió token **sin** pedir MFA | Revisar el enforcement y repetir `vpg-auth-bootstrap` |
+
+Diagnóstico real del 2026-10-02 sobre esta instancia:
+
+```
+    method_id en Vault .......: 4b2ddbcb-fe31-b4fb-d430-12c4e6d86515
+    method_id en PostgreSQL ..: 4b2ddbcb-fe31-b4fb-d430-12c4e6d86515   <- coinciden
+    algoritmo / digitos ......: SHA1 / 6
+    periodo / skew ...........: 30s / 1 pasos (tolerancia +-60s)
+    issuer en la app .........: VPG Vault
+    desfase host/contenedor ..: 1s (dentro de la tolerancia)
+
+Respuesta literal de Vault (Code: 403):
+   failed to satisfy enforcement vpg-userpass-totp. error: 2 errors occurred:
+   failed to validate TOTP passcode
+   login MFA validation failed for methodID: [4b2ddbcb-...]
+```
+
+Es decir: contraseña correcta, relojes del servidor correctos, método bien
+configurado y **sin** bloqueo por intentos. El mensaje `failed to validate TOTP
+passcode` significa que **la semilla que tiene la app no es la que tiene Vault**.
+
+Causas, por orden de probabilidad:
+
+1. **Entrada obsoleta en la app.** La semilla va asociada a la *entidad*, no al
+   método. Si alguna vez se ejecutó `--reset-totp`, o se recreó el volumen de
+   Vault, las entradas `VPG Vault` anteriores generan códigos inválidos. **Solo
+   vale la última**: borra las demás.
+2. **Hora del teléfono.** Activa la hora automática de red. El desfase
+   host/contenedor ya está comprobado (1 s), así que si hay desfase está en el
+   teléfono.
+3. **Código caducado al teclear.** El script ahora informa de los segundos de
+   tecleo y los compara con la tolerancia.
+4. **Clave mal transcrita.** En Google Authenticator:
+   **+ → Ingresar una clave de configuración**, tipo **Basada en tiempo**, sin
+   espacios. Solo letras A-Z y dígitos 2-7: la `O` es letra (nunca cero) y la
+   `I` es letra (nunca uno).
+
+**Solución definitiva.** Vault no permite volver a leer una semilla ya
+generada (es lo correcto), así que la única forma de salir de la duda es
+regenerarla. Es **destructivo** (invalida la entrada actual de la app) y por eso
+el script **nunca** lo hace por su cuenta — hay que ejecutarlo a mano:
+
+```bash
+# 1. regenera la semilla y muestra el otpauth:// UNA sola vez
+docker compose exec vault-service vpg-auth-bootstrap --reset-totp
+
+# 2. borra las entradas "VPG Vault" viejas de la app y registra la nueva,
+#    guárdala en el gestor de contraseñas y limpia la pantalla
+clear
+
+# 3. (opcional) deja constancia del reset en el modelo
+docker compose exec postgres-service psql -U vpg_admin -d vpg_contadores -c   "UPDATE employees.user_vault_identity vi
+      SET totp_status = 'reset_required', totp_generated_at = now()
+     FROM employees.users u
+    WHERE u.id = vi.user_id AND lower(u.username) = 'sinhuesiordia';"
+
+# 4. verifica
+bash scripts/postgres/verify-vault-mfa.sh
+```
+
+`--reset-totp` **no cambia el `entity_id`** (la entidad ya existe), así que el
+vínculo de PostgreSQL sigue siendo válido y **no hay que repetir**
+`seed-initial-user.sh`. Un login correcto lleva `reset_required` → `confirmed`.
 
 ### 11. Consultar una ruta Vault autorizada
 
@@ -856,8 +984,18 @@ Los tres estados posibles son `autorizada`,
 `autorizada_pero_sin_datos` (la política permite leer, la ruta no tiene datos)
 y `denegada_por_politica`. En ningún caso se imprime el contenido del secreto.
 
-**Estado: PENDIENTE**, por la misma razón que el paso 10 (necesita el token que
-solo se emite tras un TOTP válido).
+**Estado: VERIFICADA** en la ejecución del 2026-10-02, con el token emitido tras
+un login userpass + TOTP real:
+
+```
+==> Consulta de una ruta Vault autorizada (solo el resultado, sin valores)
+    ruta .....................: secret/data/sat/usuarios
+    capacidades de la sesion .: [create delete list patch read sudo update]
+    lectura ..................: autorizada
+```
+
+Las capacidades son las de la política `vpg-admin`. No se imprimió ningún valor
+del secreto, ni el token.
 
 Equivalente a mano, con una sesión ya abierta en el contenedor:
 
