@@ -5,7 +5,8 @@ Automatizacion Inteligente para contabilidad fiscal VPG
 |---|---|---|
 | [1. HashiCorp Vault](#componente-1-hashicorp-vault-credenciales) | listo | `vault-service` |
 | [2. PostgreSQL 17](#componente-2-postgresql-17-empleados-roles-y-vínculo-con-vault) | listo | `postgres-service` |
-| 3. Backend / frontend | **no implementado en esta etapa** | — |
+| [3. user-mgmt-service (FastAPI)](#componente-3-user-mgmt-service-fastapi--sqlalchemy) | listo | `user-mgmt-service` |
+| 4. Frontend | **no implementado**: esta etapa termina en el backend | — |
 
 ## Componente 1: HashiCorp Vault (credenciales del servicio)
 
@@ -1062,3 +1063,587 @@ en `127.0.0.1`.
 - No hay sistema de migraciones (ver el aviso del paso 7).
 - No hay TLS entre el cliente y PostgreSQL: solo es aceptable porque el puerto
   se publica en `127.0.0.1`.
+
+---
+
+## Componente 3: user-mgmt-service (FastAPI + SQLAlchemy)
+
+Backend REST **local** para el CRUD de empleados y la administración controlada
+de su vínculo con Vault. FastAPI 0.142, SQLAlchemy 2.1 asíncrono y Psycopg 3
+sobre los servicios de las etapas 1 y 2.
+
+> **Alcance de esta etapa.** Termina en backend, ORM, sincronización controlada
+> y comprobaciones. **No hay frontend, React ni páginas propias**, y no hay
+> despliegue VPS/Kubernetes/Terraform. Swagger UI y ReDoc sí forman parte de la
+> entrega. Tampoco hay crawling, gestión de archivos ni autenticación OIDC o
+> local: `password_hash` sigue reservado y NULL.
+
+### Archivos de este componente
+
+| Archivo | Propósito |
+|---|---|
+| `app/core/` | `config.py` (pydantic-settings), `database.py`, `vault.py`, `security.py`, `logging.py`, `rate_limit.py`, `readiness.py`, `errors.py` |
+| `app/models/employees.py` | ORM mapeado al esquema **existente**. Sin `create_all()` |
+| `app/schemas/` | DTO separados para crear, reemplazar, modificar y responder |
+| `app/repositories/` | Consultas de empleados y del registro de operaciones |
+| `app/services/` | `users.py`, `auth.py`, `vault_sync.py`, `rbac.py` |
+| `app/routers/` | `health.py`, `auth.py`, `users.py`, `vault_ops.py` |
+| `sql/002_vault_operations.sql` | Migración: registro durable de operaciones Vault |
+| `config/policies/vpg-user-mgmt.hcl` | Política de la cuenta técnica (AppRole) |
+| `scripts/user_mgmt/*.sh` | Bootstrap de AppRole, migraciones, base de pruebas, tests, reconciliación y recorrido por curl |
+| `requirements/user_mgmt.txt` | Dependencias de ejecución, fijadas |
+| `requirements/user_mgmt-dev.txt` | Dependencias **solo** de pruebas |
+| `tests/` | 91 pruebas pytest |
+
+### Arquitectura
+
+```
+routers/        HTTP, códigos de estado, OpenAPI
+   ↓ Depends
+services/       reglas de negocio, RBAC, orquestación Vault+PostgreSQL
+   ↓
+repositories/   consultas SQLAlchemy parametrizadas
+   ↓
+models/         ORM del esquema employees que ya existe
+```
+
+`core/` aporta configuración, motor de base de datos, cliente Vault, sesiones,
+logging, rate limiting y readiness. No hay repositorios genéricos ni interfaces
+abstractas sin uso concreto.
+
+**Acceso a datos.** Una `AsyncSession` por petición, nunca compartida entre
+tareas. Pool limitado (5 + 5), `pool_pre_ping`, `statement_timeout` de 15 s.
+Las relaciones se cargan con `selectinload` explícito y los `relationship` están
+en `lazy="raise"`, de modo que una carga perezosa accidental **falla en las
+pruebas** en vez de provocar N+1 silencioso en producción. `updated_at` lo
+mantiene el trigger de PostgreSQL; el ORM no lo escribe.
+
+### Dependencias y contenedor
+
+`python:3.12-alpine`, con etapa `user-mgmt-builder` donde viven gcc y las
+cabeceras, y etapa final sin compiladores, sin cabeceras y sin caché de pip.
+Comprobado en el contenedor en marcha:
+
+```
+ausente: gcc    ausente: cc    ausente: make    ausente: ld
+libpq: /usr/lib/libpq.so.5    /wheels: eliminado    usuario: vpg (uid 100)
+```
+
+Dos hallazgos reales durante el build, no supuestos:
+
+- **`psycopg[c]==3.2.3` no compila** con el gcc 15 de Alpine 3.22: `numutils.c`
+  declara `UINT64CONST(10000000000000000000)` y gcc lo rechaza por
+  desbordamiento. **3.2.13 sí compila** y es la versión fijada.
+- **La implementación pura de Python tampoco vale aquí**: resuelve libpq con
+  `ctypes.util.find_library("pq")`, que en musl devuelve `None` porque no hay
+  `ldconfig` ni `ld`, y psycopg aborta con `libpq library not found`. Añadir
+  `binutils` al runtime solo para eso sería peor que compilar en el builder.
+
+Se evita `uvicorn[standard]` a propósito: arrastra `watchfiles`, que exige
+cadena de compilación de Rust y solo sirve para `--reload`, que este servicio no
+usa. `uvloop` y `httptools` se declaran explícitamente.
+
+Uvicorn corre como usuario **no root**, con **un worker** y **sin reload**. El
+código va **en la imagen**: no hace falta volumen persistente para `/app`.
+
+### Configuración y secretos
+
+Todo lo no sensible llega por variables `USER_MGMT_*`, validadas al arrancar con
+pydantic-settings: si falta algo, el proceso falla de inmediato y con un mensaje
+concreto.
+
+Las credenciales llegan **solo por archivo**, como Compose secrets, y se montan
+**uno a uno**, nunca el directorio `secrets/` completo:
+
+| Secreto montado | Para qué |
+|---|---|
+| `/run/secrets/postgres_app_password` | Cuenta de ejecución `vpg_app` |
+| `/run/secrets/vault_role_id` | AppRole de la cuenta técnica |
+| `/run/secrets/vault_secret_id` | AppRole de la cuenta técnica |
+
+`user-mgmt-service` **no usa `env_file: .env`**: así ni `VAULT_ADMIN_USER_PASS`
+ni `VAULT_INITIAL_TOKEN` ni `VAULT_UNSEAL_KEY` entran en el entorno de la API.
+
+Dentro de la red se usan los nombres de servicio y los puertos del contenedor
+(`postgres-service:5432`, `vault-service:8200`). Los puertos publicados en el
+host no intervienen entre servicios.
+
+### Arranque: qué aborta y qué solo bloquea
+
+Dos clases de fallo, tratadas distinto a propósito:
+
+| Situación | Comportamiento |
+|---|---|
+| PostgreSQL responde pero **no hay administrador** activo con rol `admin` y vínculo a Vault | **Aborta el arranque** con un mensaje que indica ejecutar `vpg-auth-bootstrap` y `seed-initial-user.sh`. No se arregla solo |
+| PostgreSQL no responde todavía | Arranca; readiness en 503 hasta lograrlo |
+| Vault **sellado** o inaccesible | **Arranca**; `/health/ready` y todos los endpoints de negocio devuelven **503** hasta desbloquearlo |
+
+**FastAPI no crea administradores, no ejecuta semillas, no emite DDL y no hace
+unseal.** `create_all()` no aparece en ningún punto del servicio. El desbloqueo
+de Vault sigue siendo manual, como en la etapa 1; para despliegues desatendidos
+habría que configurar auto-unseal en Vault, que no es parte de esta etapa.
+
+`totp_status='pending'` **no** es un fallo de arranque: es estado histórico. No
+demuestra que la persona no tenga autenticador ni justifica reiniciar su TOTP.
+
+### Autenticación y sesiones
+
+FastAPI delega userpass + TOTP a Vault **por su API HTTP**. No ejecuta
+`docker exec`, ni un shell, ni `vpg-auth-bootstrap` por petición.
+
+1. `POST /auth/login` envía la contraseña a `auth/{path}/login/{username}`. Con
+   el enforcement activo Vault responde **sin token** y con un `mfa_request_id`.
+   Si Vault llegara a emitir token en este paso, el login se rechaza con 403:
+   significaría que el MFA no se está exigiendo.
+2. `POST /auth/mfa/verify` valida el código contra `sys/mfa/validate`. Antes de
+   entregar sesión se comprueba que el `entity_id` coincide con el registrado en
+   PostgreSQL, que el empleado está activo y que la configuración es la esperada.
+   `pending` **no** bloquea este primer login válido: es justo donde pasa a
+   `confirmed`. Y `confirmed` **no** omite el MFA.
+
+La sesión es un **identificador opaco**, admitido como `Authorization: Bearer`
+en Swagger. El token de Vault y los desafíos viven **solo en memoria**, con TTL,
+tope de entradas y limpieza periódica. Nunca se guardan en PostgreSQL ni se
+devuelven al cliente.
+
+En cada petición autenticada se comprueba que el token de Vault sigue vivo (una
+entidad deshabilitada o un token revocado invalidan la sesión aunque siga en
+memoria) y se releen los roles desde PostgreSQL.
+
+> **Limitación documentada.** Reiniciar el único worker invalida todas las
+> sesiones. Con varios workers o réplicas cada proceso tendría su propio
+> diccionario y una sesión solo funcionaría en el proceso que la creó: ese
+> escenario exige otro diseño. No se añade Redis en esta etapa.
+
+### Cuenta técnica: AppRole
+
+Separada de las sesiones humanas, con su propia política `vpg-user-mgmt`.
+**Nunca** el Initial Root Token ni la contraseña del administrador.
+
+La política es estrecha a propósito. **No** incluye `secret/*` (la API no lee
+secretos del SAT; `/vault/access-check` usa el token humano), ni escritura sobre
+`sys/policies`, `sys/auth` o el enforcement, ni `create`/`delete` sobre el método
+TOTP compartido, ni revocación por prefijo.
+
+Un hallazgo real: **`sys/auth/*` es una ruta protegida por root en Vault**.
+Leerla exige `sudo` además de `read`; sin él la respuesta es
+`403 permission denied` aunque el montaje exista. La política lo documenta y lo
+acota a ese único montaje y solo en lectura.
+
+Las políticas asignables a cuentas nuevas salen de una **allowlist** del
+servicio (`USER_MGMT_VAULT_ASSIGNABLE_POLICIES`). El cuerpo HTTP no puede elegir
+una política arbitraria, y la configuración **rechaza al arrancar** que
+`vpg-admin` figure en esa lista: esa política se asigna a mano, nunca por un rol
+de aplicación.
+
+### Contrato REST
+
+Prefijo `/user_mgmt/v1`. Conserva `/user` del contrato original. UUID en las
+rutas; contraseñas y códigos TOTP **solo en cuerpos**.
+
+| Método | Ruta | Resultado |
+|---|---|---|
+| POST | `/user` | 201; empleado creado |
+| GET | `/user` | 200; lista paginada |
+| POST | `/user/search` | 200; búsqueda por datos personales, con cuerpo |
+| GET | `/user/{user_id}` | 200; detalle autorizado |
+| PUT | `/user/{user_id}` | 200; reemplazo de campos editables |
+| PATCH | `/user/{user_id}` | 200; modificación parcial |
+| DELETE | `/user/{user_id}` | 204; baja lógica terminada |
+| DELETE | `/user/{user_id}/purge` | 204; eliminación definitiva, solo admin |
+| PUT | `/user/{user_id}/roles` | 200; asignación de roles, solo admin |
+| GET | `/user/{user_id}/operations` | 200; historial de operaciones Vault |
+| POST | `/user/{user_id}/vault/provision` | 201; identidad y enrolamiento inicial |
+| PATCH | `/user/{user_id}/vault/credentials` | 200; username/contraseña |
+| POST | `/user/{user_id}/mfa/reset` | 200; reset explícito |
+| POST | `/auth/login` | 200; desafío MFA, sin sesión |
+| POST | `/auth/mfa/verify` | 200; sesión API tras MFA válido |
+| POST | `/auth/logout` | 204; cierre y revocación |
+| GET | `/auth/me` | 200; datos de la sesión actual |
+| POST | `/vault/access-check` | 200; resultado de autorización, sin valores |
+| GET | `/vault/operations/{operation_id}` | 200; estado de una operación |
+| GET | `/health/live`, `/health/ready` | 200 / 503 |
+
+**Sin datos personales en URLs.** Los filtros de listado se limitan a rol y
+estado. Para buscar por correo, RFC o CURP está `POST /user/search`, con cuerpo,
+y sus valores no se registran.
+
+**POST /user** crea en **una sola transacción** `employees.users`,
+`employees.user_profiles` y `employees.user_roles`, más los contactos enviados.
+Si cualquier inserción o validación falla, se revierte todo. Un `admin` puede
+elegir uno o varios códigos ya existentes en `employees.roles`; un `manager`
+no puede enviarlos y el servidor asigna `employee`. Este endpoint nunca crea
+filas nuevas en el catálogo de roles. El provisionamiento en Vault es un
+endpoint aparte.
+
+**PUT frente a PATCH.** PUT describe el estado final: las colecciones que
+lleguen vacías se vacían. PATCH es parcial: un campo omitido se deja como está,
+nunca se interpreta como borrado; para modificar un contacto hay que enviar su
+`id` y para borrarlo usar `remove_*_ids`.
+
+Paginación `limit=20` (1–100), `offset>=0`, orden **estable** (la columna
+elegida y, como desempate, el UUID) y **allowlist** de columnas ordenables.
+
+Los DTO rechazan campos desconocidos y no admiten `id`, marcas de auditoría,
+`auth_provider`, `password_hash`, roles ni el vínculo con Vault por asignación
+masiva. La validación normaliza por dominio (RFC y CURP en mayúsculas, correo y
+usuario en minúsculas, teléfono a dígitos) y comprueba que las posiciones 5-10
+de RFC y CURP cuadren con la fecha de nacimiento. No hay un "sanitizador
+genérico" que altere contraseñas ni enmascare errores.
+
+### RBAC y autorización por objeto
+
+| Capacidad | `admin` | `manager` | `employee` |
+|---|---|---|---|
+| Crear empleados | ✅ | ✅ (siempre como `employee`) | ❌ |
+| Elegir roles al crear | ✅ | ❌ (403) | ❌ |
+| Leer cualquier empleado | ✅ | ✅ | solo a sí mismo |
+| Modificar contactos ajenos | ✅ | ✅ | ❌ |
+| Modificar sus propios contactos | ✅ | ✅ | ✅ |
+| Modificar perfil fiscal | ✅ | ✅ | ❌ |
+| Asignar roles | ✅ | ❌ | ❌ |
+| Provisionar o cambiar credenciales | ✅ | ❌ | ❌ |
+| Reset de MFA ajeno | ✅ (+ MFA reciente) | ❌ | ❌ |
+| Purgar | ✅ (+ MFA reciente, nunca a sí mismo) | ❌ | ❌ |
+
+**Autorización por objeto**: conocer el UUID de otro empleado no permite leerlo
+ni modificarlo. Se devuelve **403**, no un 404 cosmético: enmascarar no es
+autorizar.
+
+Un `manager` puede crear fichas pendientes sin acceso a Vault; el
+provisionamiento posterior lo hace un `admin`. La **última cuenta admin activa**
+está protegida frente a quitarle el rol y frente a la baja, y la autopurga está
+bloqueada.
+
+Los roles de aplicación, los roles de PostgreSQL y las políticas de Vault son
+cosas distintas. El servicio **no asigna `vpg-admin` por tener el rol `admin`**.
+
+### Operaciones Vault y consistencia
+
+**Una transacción de PostgreSQL no revierte Vault.** De ahí el diseño:
+
+- Ninguna transacción de base de datos permanece abierta durante una llamada de
+  red. Cada operación abre transacciones cortas: validar y registrar, llamar a
+  Vault, registrar el resultado.
+- Cada fase se escribe en `employees.vault_operations` (migración 002) antes de
+  seguir. El registro guarda `operation_id`, tipo, usuario objetivo, fases,
+  estado y error **ya saneado**; nunca contraseñas, tokens ni semillas.
+- Dos invariantes los impone la base, no el código: una `Idempotency-Key` no
+  crea dos operaciones, y **como máximo una operación viva por usuario
+  objetivo**, lo que serializa peticiones concurrentes sin mantener abierta una
+  transacción.
+- **Nada se reintenta solo.** Login, TOTP y generación de semillas no son
+  idempotentes.
+- Si Vault ya cambió y PostgreSQL no puede reflejarlo, la respuesta **no es
+  201/204**: es **409** con el `operation_id`, y la operación queda en
+  `needs_reconciliation`.
+
+| Operación | Comportamiento |
+|---|---|
+| **Provisionar** | Crea cuenta userpass, entidad y alias con el **accessor existente**, y genera la semilla TOTP de esa entidad con el método compartido. El URI `otpauth://` se entrega **una sola vez**, con `Cache-Control: no-store`, nunca se registra y ningún GET lo devuelve. Si falla a mitad, compensa **solo lo que creó esa operación** |
+| **Leer** | Muestra el estado histórico y su aviso. **El GET nunca genera, destruye ni reinicia TOTP, y no cambia credenciales** |
+| **Credenciales** | La contraseña se envía directamente a Vault y no se persiste. Vault **no ofrece rename de userpass**: la secuencia real es crear la cuenta nueva, repuntar el alias a la **misma entidad** (lo que conserva `entity_id` y la semilla ya registrada) y solo entonces borrar la anterior. Por eso cambiar el username **exige** enviar también `new_password`: si falta, se rechaza con 422 y no se toca nada, en vez de inventar la contraseña anterior |
+| **Reset TOTP** | Exige admin, confirmación explícita (`confirm: "RESET"`) y **MFA reciente**. Destruye y regenera solo la semilla de la entidad objetivo; método, enforcement y demás personas quedan intactos. Invalida las sesiones del objetivo, limpia la confirmación vigente y deja `reset_required` |
+| **Baja lógica** | `is_active=false`, invalida sesiones y **deshabilita la entidad en Vault**, que es lo que bloquea también los tokens ya emitidos. Deshabilitar **no** equivale a revocar; la revocación es solo del objetivo, nunca global del montaje. Si la entidad no se pudo deshabilitar, **no se devuelve 204**: la baja no está completa |
+| **Purga** | Solo admin, sobre un usuario ya desactivado, nunca a uno mismo. Borra únicamente **sus** cuenta, alias, entidad y enrolamiento. Si la entidad tiene alias de otros montajes o nombres, la purga **se detiene con 409** y lo explica. El registro de la operación sobrevive como auditoría mínima |
+
+**Reconciliación**: `bash scripts/user_mgmt/reconcile-operations.sh list |
+inspect <id> | close <id> "nota"`. No deshace nada por su cuenta: muestra el
+estado real de los dos sistemas para que una persona decida.
+
+### Protección y auditoría
+
+Logs **JSON** con `X-Request-ID` validado o generado (un valor del cliente con
+saltos de línea no puede inyectar líneas en el log), actor, UUID objetivo,
+operación, estado y duración.
+
+**Nunca se registran**: cuerpos de login o enrolamiento, `Authorization`,
+tokens, contraseñas, códigos TOTP, URIs `otpauth://`, QR ni valores de secretos.
+El formateador redacta por **nombre de clave** y por **patrón** en texto libre
+(`hvs.…`, `otpauth://…`). Los errores de Vault se sanean antes de mostrarse, sin
+perder el diagnóstico interno. El `access log` de uvicorn está desactivado y
+SQLAlchemy no imprime sentencias ni parámetros.
+
+La respuesta de validación muestra campo y motivo, **nunca el valor enviado**:
+el cuerpo puede llevar una contraseña o un código.
+
+**Rate limiting** en memoria por ventana deslizante: login, MFA, por sesión en
+CRUD y global, con `Retry-After` en los 429. Configurable por `USER_MGMT_*`.
+
+> **Límite documentado.** Los contadores viven en el proceso: con varios workers
+> el límite efectivo se multiplicaría. Y esto **no es una defensa contra IDOR**:
+> la autorización por objeto se comprueba en cada endpoint. Tampoco hay
+> aislamiento multi-inquilino, porque no existe ese dominio en el proyecto.
+
+---
+
+## Comprobaciones reproducibles (etapa 3)
+
+Desde la raíz del repositorio, en Git Bash. Las marcadas **🖐 INTERACTIVO**
+piden algo por teclado.
+
+### 1. Preparar secretos, política de servicio y migraciones
+
+```bash
+# Secretos de PostgreSQL (etapa 2; no sobrescribe si ya existen)
+bash scripts/postgres/prepare-secrets.sh
+
+# Vault debe estar desbloqueado (paso MANUAL de la etapa 1)
+docker compose exec vault-service vault operator unseal
+
+# Política vpg-user-mgmt + AppRole + secrets/vault_role_id y vault_secret_id
+bash scripts/user_mgmt/vault-approle-bootstrap.sh
+
+# Migraciones 001 y 002 con la cuenta ADMINISTRATIVA, y permisos para vpg_app
+bash scripts/user_mgmt/apply-migrations.sh
+```
+
+**Resultado real**
+
+```
+==> Escribiendo la politica 'vpg-user-mgmt'
+    politica escrita
+    auth approle habilitado en approle/
+    rol vpg-user-mgmt configurado (politica vpg-user-mgmt, token_ttl 1h)
+    vault_role_id      36 caracteres
+    vault_secret_id    36 caracteres
+
+  rolname  | select | insert | update | truncate | puede_ddl
+-----------+--------+--------+--------+----------+-----------
+ vpg_admin | t      | t      | t      | t        | t
+ vpg_app   | t      | t      | t      | f        | f      <- sin DDL ni TRUNCATE
+
+10 tablas (las 9 de la etapa 2 + vault_operations)
+```
+
+### 2. Construir, validar y arrancar
+
+```bash
+docker compose config --quiet && echo "config OK"
+docker compose build
+docker compose up -d
+docker compose ps
+```
+
+El `healthcheck` del servicio usa `/health/live`, no `/health/ready`: el
+contenedor está sano aunque Vault siga sellado. `interval=15s`, `timeout=5s`,
+`retries=5`, `start_period=20s`.
+
+`postgres-service` es dependencia `service_healthy`. `vault-service` es
+`service_started` **a propósito**: arranca sellado y la API debe poder
+levantarse igualmente.
+
+### 3. Readiness con Vault sellado: 503
+
+```bash
+docker compose restart vault-service     # vuelve a quedar sellado
+curl -s -w '\nHTTP %{http_code}\n' http://127.0.0.1:8000/health/ready
+curl -s -w '\nHTTP %{http_code}\n' http://127.0.0.1:8000/user_mgmt/v1/user
+```
+
+**Resultado real**
+
+```
+HTTP 503
+{
+  "ready": false,
+  "checks": {
+    "postgres_select_1": true,
+    "vault_initialized": true,
+    "vault_unsealed": false,
+    "vault_technical_credential": false,
+    "admin_linked_in_postgres_and_vault": false
+  },
+  "detail": "vault: sellado ('vault operator unseal', paso manual); vault: pendiente de comprobar el vinculo del administrador"
+}
+
+HTTP 503
+{"code":"not_ready","message":"el servicio todavia no esta listo: vault: sellado ...","request_id":"843d2ff7..."}
+```
+
+Tras desbloquear Vault, el refresco periódico lo detecta solo (sin reiniciar la
+API):
+
+```
+HTTP 200
+{"ready": true, "checks": {"postgres_select_1": true, "vault_initialized": true,
+ "vault_unsealed": true, "vault_technical_credential": true,
+ "admin_linked_in_postgres_and_vault": true}, "detail": null}
+```
+
+### 4. Salud, DNS y conexiones internas
+
+```bash
+curl -s http://127.0.0.1:8000/health/live
+docker compose exec user-mgmt-service python -c "
+import socket
+for h in ('postgres-service','vault-service'): print(h, socket.gethostbyname(h))"
+```
+
+**Resultado real**
+
+```
+{"status":"alive"}
+postgres-service 172.18.0.3
+vault-service    172.18.0.2
+```
+
+### 5. Swagger, ReDoc y OpenAPI
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/docs
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/redoc
+curl -s http://127.0.0.1:8000/openapi.json | python -c "
+import json,sys
+d=json.load(sys.stdin)
+print(sum(1 for p in d['paths'] for m in d['paths'][p] if m in ('get','post','put','patch','delete')), 'operaciones')"
+```
+
+**Resultado real**: `200`, `200`, `21 operaciones`. En el navegador,
+<http://127.0.0.1:8000/docs>: **Authorize** acepta el `api_session`.
+
+### 6. 🖐 INTERACTIVO — Recorrido completo por curl
+
+```bash
+bash scripts/user_mgmt/smoke-api.sh
+```
+
+Pide el código TOTP con eco enmascarado (`#` por dígito). La contraseña sale de
+`VAULT_ADMIN_USER_PASS` y viaja por stdin: nunca como argumento visible ni en el
+historial. Demuestra, con **datos ficticios**: login sin sesión antes del MFA,
+login válido, alta, lectura y paginación, PUT frente a PATCH, 401/403/409/422/429,
+provisionamiento, GET que no reinicia el TOTP, cambio de credenciales, reset
+explícito, baja lógica, purga y `access-check`.
+
+Con `--keep` conserva el empleado de prueba; por defecto lo purga al terminar.
+
+### 7. Pruebas automáticas
+
+```bash
+bash scripts/user_mgmt/prepare-test-db.sh     # base vpg_contadores_test
+bash scripts/user_mgmt/run-tests.sh           # pytest en un contenedor efímero
+bash scripts/user_mgmt/run-tests.sh -k rbac -v
+```
+
+**Resultado real**
+
+```
+91 passed in 42.46s
+```
+
+Cubren CRUD, validación, RBAC, aislamiento por objeto, login/MFA, compatibilidad
+del ORM con el esquema real, baja, purga, reset explícito, cambio de
+credenciales, idempotencia, fallos parciales, saneado de logs, rate limiting y
+contrato OpenAPI.
+
+Usan **PostgreSQL real** en `vpg_contadores_test` con el mismo esquema (SQLite no
+tiene índices parciales ni CHECK con regex, así que "pasar" allí no demostraría
+nada) y un **doble controlado de Vault**. No tocan `vpg_contadores`, ni la cuenta
+de `VAULT_ADMIN_USER_NAME`, ni el Vault real.
+
+> **El MFA real es una comprobación manual** (paso 6 y etapa 2, paso 10). No se
+> deduce de los dobles.
+
+### 8. Fallo parcial y reconciliación
+
+Las pruebas lo ejercitan (`test_fallo_en_vault_compensa_lo_creado`): cuando falla
+la generación de la semilla tras crear cuenta y entidad, la operación queda en
+`failed`, las fases registradas son
+`userpass_user_created → compensate_userpass`, y en Vault no queda nada de esa
+operación. Para inspeccionar en vivo:
+
+```bash
+bash scripts/user_mgmt/reconcile-operations.sh list
+bash scripts/user_mgmt/reconcile-operations.sh inspect <operation_id>
+bash scripts/user_mgmt/reconcile-operations.sh close <operation_id> "resuelto a mano"
+```
+
+### 9. Persistencia al recrear solo la API
+
+```bash
+docker compose rm -sf user-mgmt-service
+docker compose up -d user-mgmt-service
+docker compose exec postgres-service psql -U vpg_admin -d vpg_contadores -c "
+SELECT u.username, vi.totp_status FROM employees.users u
+  JOIN employees.user_vault_identity vi ON vi.user_id = u.id;"
+docker volume ls --filter name=vpg-
+```
+
+**Resultado real**
+
+```
+antes:   03572c00-...|sinhuesiordia|confirmed
+despues: 03572c00-...|sinhuesiordia|confirmed     <- idéntico
+vpg-postgres-data, vpg-vault-data                  <- intactos
+```
+
+Las **sesiones en memoria sí se pierden** al reiniciar el worker: es el límite
+documentado del diseño de un solo worker.
+
+---
+
+## Seguridad (etapa 3)
+
+### Escaneo de la imagen
+
+**No se afirma que la imagen esté libre de vulnerabilidades.** Se evaluó y este
+es el resultado real del 2026-10-04:
+
+```bash
+docker scout cves vpg/user-mgmt-server:0.3.0
+docker scout cves --only-severity critical,high vpg/user-mgmt-server:0.3.0
+```
+
+```
+Target: vpg/user-mgmt-server:0.3.0
+  82 paquetes indexados
+  0 CRITICAL | 0 HIGH | 5 MEDIUM | 1 LOW
+```
+
+El primer escaneo, con `fastapi==0.115.6`, encontró **3 HIGH en
+`starlette 0.41.3`** (CVE-2026-54283, CVE-2026-48818, CVE-2025-62727). Por eso
+las versiones se subieron a FastAPI 0.142.2 y Starlette 1.7.0, fijada de forma
+explícita aunque llegue como dependencia. Las 91 pruebas siguen pasando tras el
+cambio. Quedan 5 MEDIUM y 1 LOW sin resolver.
+
+Comparación con la etapa 2, sin cambios: `vpg/postgres-server:17-alpine` sigue
+con 2 CRITICAL y 22 HIGH heredadas de `gosu` en la imagen oficial.
+
+### Contradicción corregida
+
+El `compose.yaml` publicaba Vault con `"${VAULT_PORT_LOCAL}:${VAULT_PORT_REMOTE}"`,
+es decir en **0.0.0.0**, mientras el texto del README prometía `127.0.0.1`.
+Comprobado en el Compose real:
+
+```
+vpg-vault   0.0.0.0:8200->8200/tcp, [::]:8200->8200/tcp     <- antes
+```
+
+Ahora las tres publicaciones llevan bind explícito al loopback
+(`VAULT_HOST_BIND`, `POSTGRES_HOST_BIND`, `USER_MGMT_HOST_BIND`, todas
+`127.0.0.1`). Sin el bind explícito, Docker publica en todas las interfaces.
+
+### Otras decisiones
+
+- `security_opt: no-new-privileges:true`; Uvicorn corre como `vpg` (uid 100).
+- La API no carga el `.env` del proyecto: `VAULT_ADMIN_USER_PASS`,
+  `VAULT_INITIAL_TOKEN` y `VAULT_UNSEAL_KEY` no entran en su entorno.
+- Se montan tres archivos de secreto concretos, no el directorio `secrets/`.
+- `vpg_app` no tiene `CREATE` en el esquema ni `TRUNCATE`: comprobado, y las
+  pruebas se limpian con `DELETE` justo por eso.
+- Sin TLS entre cliente y API: aceptable solo porque el puerto se publica en
+  `127.0.0.1`.
+
+### Límites conocidos de esta etapa
+
+- Sesiones y rate limiting **en memoria**: un solo worker. Varios workers o
+  réplicas exigen otro diseño.
+- `password_hash` sigue **reservado y NULL**: no hay autenticación local ni OIDC
+  en la API todavía.
+- El `/vault/access-check` evalúa una **allowlist de rutas lógicas**, no rutas
+  arbitrarias.
+- La correspondencia rol de aplicación ↔ política de Vault para `manager` y
+  `employee` sigue **pendiente** (tabla de la etapa 2): hoy solo existen
+  `vpg-admin`, `vpg-oidc-user` y la nueva `vpg-user-mgmt`.
+- No hay sistema de migraciones automático: `apply-migrations.sh` aplica
+  archivos numerados de forma explícita.

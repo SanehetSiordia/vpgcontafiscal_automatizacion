@@ -17,7 +17,8 @@ services:
     environment:
       VAULT_LOG_LEVEL: ${VAULT_LOG_LEVEL}
     ports:
-      - "${VAULT_PORT_LOCAL}:${VAULT_PORT_REMOTE}"
+      # Solo loopback del host: sin el bind explicito, Docker publica en 0.0.0.0.
+      - "${VAULT_HOST_BIND}:${VAULT_PORT_LOCAL}:${VAULT_PORT_REMOTE}"
     volumes:
       - vault-data:/vault/data
     networks:
@@ -71,6 +72,71 @@ services:
     depends_on:
       - vault-service
 
+  user-mgmt-service:
+    # Sin env_file: la API no carga el .env del proyecto. Recibe solo sus
+    # parametros USER_MGMT_* y lee las credenciales de archivos de secreto.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: user-mgmt-server
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION}
+    image: vpg/user-mgmt-server:${USER_MGMT_VERSION}
+    container_name: ${USER_MGMT_CONTAINER_NAME}
+    hostname: user-mgmt-service
+    restart: unless-stopped
+    environment:
+      USER_MGMT_ENVIRONMENT: ${USER_MGMT_ENVIRONMENT}
+      USER_MGMT_LOG_LEVEL: ${USER_MGMT_LOG_LEVEL}
+      USER_MGMT_API_PREFIX: ${USER_MGMT_API_PREFIX}
+      # Dentro de la red se usan los nombres de servicio y los puertos del
+      # contenedor; los puertos publicados en el host no intervienen.
+      USER_MGMT_POSTGRES_HOST: postgres-service
+      USER_MGMT_POSTGRES_PORT: ${POSTGRES_PORT_REMOTE}
+      USER_MGMT_POSTGRES_DB: ${POSTGRES_DB}
+      USER_MGMT_POSTGRES_USER: ${POSTGRES_APP_USER}
+      USER_MGMT_POSTGRES_SCHEMA: ${POSTGRES_SCHEMA}
+      USER_MGMT_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_app_password
+      USER_MGMT_VAULT_ADDR: http://vault-service:${VAULT_PORT_REMOTE}
+      USER_MGMT_VAULT_USERPASS_PATH: ${VAULT_USERPASS_PATH}
+      USER_MGMT_VAULT_MFA_METHOD_NAME: ${VAULT_MFA_METHOD_NAME}
+      USER_MGMT_VAULT_MFA_ENFORCEMENT: ${VAULT_MFA_ENFORCEMENT}
+      USER_MGMT_VAULT_ROLE_ID_FILE: /run/secrets/vault_role_id
+      USER_MGMT_VAULT_SECRET_ID_FILE: /run/secrets/vault_secret_id
+      USER_MGMT_SESSION_TTL_SECONDS: ${USER_MGMT_SESSION_TTL_SECONDS}
+      USER_MGMT_CHALLENGE_TTL_SECONDS: ${USER_MGMT_CHALLENGE_TTL_SECONDS}
+      USER_MGMT_SENSITIVE_OP_MFA_MAX_AGE_SECONDS: ${USER_MGMT_SENSITIVE_OP_MFA_MAX_AGE_SECONDS}
+      USER_MGMT_RATE_LIMIT_LOGIN_PER_MINUTE: ${USER_MGMT_RATE_LIMIT_LOGIN_PER_MINUTE}
+      USER_MGMT_RATE_LIMIT_MFA_PER_MINUTE: ${USER_MGMT_RATE_LIMIT_MFA_PER_MINUTE}
+      USER_MGMT_RATE_LIMIT_SESSION_PER_MINUTE: ${USER_MGMT_RATE_LIMIT_SESSION_PER_MINUTE}
+    secrets:
+      # Solo estos tres archivos, no el directorio secrets/ completo.
+      - postgres_app_password
+      - vault_role_id
+      - vault_secret_id
+    ports:
+      - "${USER_MGMT_HOST_BIND}:${USER_MGMT_PORT_LOCAL}:${USER_MGMT_PORT_REMOTE}"
+    networks:
+      - ${DOCKER_NETWORK_NAME}
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres-service:
+        condition: service_healthy
+      # Vault NO lleva condition: service_healthy a proposito. Arranca sellado
+      # y el desbloqueo es manual: la API debe poder levantarse igualmente y
+      # responder 503 en readiness hasta que se desbloquee.
+      vault-service:
+        condition: service_started
+    healthcheck:
+      # /health/live, no /health/ready: el contenedor esta sano aunque Vault
+      # siga sellado. Readiness es otra cosa y se consulta aparte.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
 volumes:
   vault-data:
     name: ${VAULT_VOLUME_NAME}
@@ -90,3 +156,10 @@ secrets:
     file: ./secrets/postgres_password
   postgres_app_password:
     file: ./secrets/postgres_app_password
+  # Credenciales de la cuenta tecnica (AppRole) de user-mgmt-service, creadas
+  # por scripts/user_mgmt/vault-approle-bootstrap.sh. Nunca el Initial Root
+  # Token ni la contrasena del administrador humano.
+  vault_role_id:
+    file: ./secrets/vault_role_id
+  vault_secret_id:
+    file: ./secrets/vault_secret_id

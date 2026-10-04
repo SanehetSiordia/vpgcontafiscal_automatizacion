@@ -7,6 +7,11 @@
 !sql/001_employees.sql
 !scripts/postgres/pg-schema.sh
 !scripts/postgres/pg-app-role.sh
+!requirements/user_mgmt.txt
+!app/**/*.py
+!requirements/user_mgmt-dev.txt
+!tests/**/*.py
+!pytest.ini
 
 # Explícito, aunque ya queda excluido por la regla anterior.
 .env

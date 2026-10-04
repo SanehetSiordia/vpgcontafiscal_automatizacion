@@ -1,5 +1,6 @@
 ARG VAULT_VERSION=2.1.1
 ARG POSTGRES_VERSION=17-alpine
+ARG PYTHON_VERSION=3.12-alpine
 
 # =============================================================================
 # Componente 1: HashiCorp Vault
@@ -63,3 +64,57 @@ RUN ln -sf /usr/local/bin/vpg-pg-schema /docker-entrypoint-initdb.d/10-schema.sh
  && ln -sf /usr/local/bin/vpg-pg-roles  /docker-entrypoint-initdb.d/20-app-role.sh
 EXPOSE 5432
 VOLUME ["/var/lib/postgresql/data"]
+
+# =============================================================================
+# Componente 3: user-mgmt-service (FastAPI)
+# =============================================================================
+
+# Etapa builder: aqui viven gcc y las cabeceras. Varias dependencias no publican
+# rueda para musl (psycopg-c, uvloop, httptools, pydantic-core) y se compilan.
+FROM python:${PYTHON_VERSION} AS user-mgmt-builder
+RUN apk add --no-cache build-base musl-dev postgresql-dev libffi-dev
+COPY requirements/user_mgmt.txt /tmp/user_mgmt.txt
+RUN python -m pip install --no-cache-dir --upgrade pip wheel \
+ && python -m pip wheel --no-cache-dir --wheel-dir /wheels -r /tmp/user_mgmt.txt
+
+# Etapa final: solo la biblioteca de cliente de PostgreSQL en tiempo de
+# ejecucion. Sin compiladores, sin cabeceras, sin cache de pip.
+FROM python:${PYTHON_VERSION} AS user-mgmt-server
+RUN apk add --no-cache libpq \
+ && addgroup -S vpg && adduser -S -G vpg -h /app vpg
+COPY --from=user-mgmt-builder /wheels /wheels
+COPY requirements/user_mgmt.txt /tmp/user_mgmt.txt
+RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels \
+      -r /tmp/user_mgmt.txt \
+ && rm -rf /wheels /tmp/user_mgmt.txt /root/.cache
+
+WORKDIR /app
+# El codigo va EN la imagen: no hace falta volumen persistente para /app.
+COPY --chown=vpg:vpg app/ /app/app/
+# Normaliza CRLF por si Git los convirtio en Windows.
+RUN find /app/app -name '*.py' -exec sed -i 's/\r$//' {} + \
+ && python -m compileall -q /app/app \
+ && chown -R vpg:vpg /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+USER vpg
+EXPOSE 8000
+# Un worker y sin reload: las sesiones viven en memoria del proceso.
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--no-access-log", "--proxy-headers"]
+
+# Etapa de PRUEBAS: parte del runtime y le anade solo las dependencias de test.
+# No forma parte de la imagen que se publica; se construye a demanda con
+# `--target user-mgmt-test`.
+FROM user-mgmt-server AS user-mgmt-test
+USER root
+COPY requirements/user_mgmt-dev.txt /tmp/dev.txt
+RUN python -m pip install --no-cache-dir -r /tmp/dev.txt && rm -f /tmp/dev.txt
+COPY --chown=vpg:vpg tests/ /app/tests/
+COPY --chown=vpg:vpg pytest.ini /app/pytest.ini
+RUN find /app/tests -name '*.py' -exec sed -i 's/\r$//' {} +
+USER vpg
+CMD ["python", "-m", "pytest"]
