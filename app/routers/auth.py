@@ -20,7 +20,14 @@ from app.deps import (
     require_ready,
 )
 from app.repositories import users as users_repo
-from app.schemas.auth import LoginChallenge, LoginRequest, MfaVerifyRequest, SessionOut
+from app.schemas.auth import (
+    LoginChallenge,
+    LoginRequest,
+    MfaVerifyRequest,
+    SessionOut,
+    StepUpChallengeOut,
+)
+from app.schemas.internal import StepUpBeginRequest, StepUpProofOut, StepUpVerifyRequest
 from app.services.auth import AuthService
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -96,6 +103,81 @@ async def verify_mfa(
         entity_id=api_session.entity_id,
         vault_policies=list(api_session.vault_policies),
         expires_at=api_session.expires_at,
+    )
+
+
+@router.post(
+    "/mfa/step-up",
+    response_model=StepUpChallengeOut,
+    responses=AUTH_ERRORS | {403: COMMON_ERRORS[403]},
+    dependencies=[Depends(require_ready), Depends(rate_limit_login)],
+    summary="Paso 1 de la reautenticacion para una operacion destructiva",
+    description=(
+        "Pide la contrasena del **titular de la sesion**. El usuario sale de la "
+        "sesion, no del cuerpo: no se puede reautenticar a nombre de otra persona.\n\n"
+        "La operacion y el conjunto de recursos se fijan **aqui**, antes de pedir "
+        "el codigo. La prueba que se emite despues autoriza esa operacion sobre "
+        "ese conjunto cerrado y nada mas.\n\n"
+        "Devuelve un `challenge_id`: **todavia no hay prueba**. Hay que completar "
+        "`/auth/mfa/step-up/verify` con el codigo TOTP."
+    ),
+)
+async def begin_step_up(
+    payload: StepUpBeginRequest,
+    response: Response,
+    api_session: Annotated[ApiSession, Depends(current_session)],
+    auth: Annotated[AuthService, Depends(get_auth_service)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> StepUpChallengeOut:
+    response.headers["Cache-Control"] = "no-store"
+    challenge = await auth.begin_step_up(
+        api_session=api_session,
+        password=payload.password,
+        operation=payload.operation,
+        collection_id=payload.collection_id,
+        resource_ids=tuple(payload.resource_ids),
+    )
+    return StepUpChallengeOut(
+        challenge_id=challenge.challenge_id,
+        operation=challenge.operation,
+        collection_id=challenge.collection_id,
+        resource_ids=list(challenge.resource_ids),
+        method_name=settings.vault_mfa_method_name,
+        expires_in_seconds=settings.challenge_ttl_seconds,
+    )
+
+
+@router.post(
+    "/mfa/step-up/verify",
+    response_model=StepUpProofOut,
+    responses=AUTH_ERRORS | {403: COMMON_ERRORS[403]},
+    dependencies=[Depends(require_ready), Depends(rate_limit_mfa)],
+    summary="Paso 2 de la reautenticacion: devuelve la prueba breve de MFA",
+    description=(
+        "Valida el codigo contra `sys/mfa/validate` de Vault. Aqui **no** se "
+        "comparan digitos ni se consultan semillas en PostgreSQL, y **no** se "
+        "acepta un booleano enviado por el cliente.\n\n"
+        "El token que Vault emite al validar se revoca de inmediato: la sesion ya "
+        "tiene el suyo.\n\n"
+        "La prueba se envia en la cabecera `X-VPG-MFA-Proof` a vault-mgmt-service. "
+        "Es de **un solo uso**, caduca pronto y esta ligada a esta sesion, a ti, a "
+        "la operacion y al conjunto de recursos declarados en el paso 1."
+    ),
+)
+async def verify_step_up(
+    payload: StepUpVerifyRequest,
+    response: Response,
+    auth: Annotated[AuthService, Depends(get_auth_service)],
+) -> StepUpProofOut:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    proof = await auth.complete_step_up(payload.challenge_id, payload.code)
+    return StepUpProofOut(
+        mfa_proof=proof.proof_id,
+        operation=proof.operation,
+        collection_id=proof.collection_id,
+        resource_ids=sorted(proof.resource_ids),
+        expires_at=proof.expires_at,
     )
 
 

@@ -109,11 +109,21 @@ services:
       USER_MGMT_RATE_LIMIT_LOGIN_PER_MINUTE: ${USER_MGMT_RATE_LIMIT_LOGIN_PER_MINUTE}
       USER_MGMT_RATE_LIMIT_MFA_PER_MINUTE: ${USER_MGMT_RATE_LIMIT_MFA_PER_MINUTE}
       USER_MGMT_RATE_LIMIT_SESSION_PER_MINUTE: ${USER_MGMT_RATE_LIMIT_SESSION_PER_MINUTE}
+      # --- Etapa 4: pasarela interna para vault-mgmt-service ----------------
+      USER_MGMT_INTERNAL_CREDENTIAL_FILE: /run/secrets/vault_mgmt_internal_token
+      USER_MGMT_MFA_PROOF_TTL_SECONDS: ${VAULT_MGMT_MFA_PROOF_TTL_SECONDS}
+      USER_MGMT_CATALOG_SCHEMA: ${VAULT_MGMT_POSTGRES_SCHEMA}
+      USER_MGMT_WRAP_TTL_SECONDS: ${VAULT_MGMT_WRAP_TTL_SECONDS}
+      USER_MGMT_MAX_VERSIONS_PER_REQUEST: ${VAULT_MGMT_MAX_VERSIONS_PER_REQUEST}
+      USER_MGMT_MAX_COLLECTION_BATCH: ${VAULT_MGMT_MAX_COLLECTION_BATCH}
     secrets:
-      # Solo estos tres archivos, no el directorio secrets/ completo.
+      # Solo estos archivos, no el directorio secrets/ completo.
       - postgres_app_password
       - vault_role_id
       - vault_secret_id
+      # Credencial compartida con vault-mgmt-service. Las DOS puntas la leen de
+      # archivo; nunca viaja como variable de entorno con su valor.
+      - vault_mgmt_internal_token
     ports:
       - "${USER_MGMT_HOST_BIND}:${USER_MGMT_PORT_LOCAL}:${USER_MGMT_PORT_REMOTE}"
     networks:
@@ -132,6 +142,75 @@ services:
       # /health/live, no /health/ready: el contenedor esta sano aunque Vault
       # siga sellado. Readiness es otra cosa y se consulta aparte.
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  vault-mgmt-service:
+    # Sin env_file, igual que user-mgmt: este proceso no debe ver la clave de
+    # unseal ni el token inicial de Vault que viven en el .env del proyecto.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: vault-mgmt-server
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION}
+    image: vpg/vault-mgmt-server:${VAULT_MGMT_VERSION}
+    container_name: ${VAULT_MGMT_CONTAINER_NAME}
+    hostname: vault-mgmt-service
+    restart: unless-stopped
+    environment:
+      VAULT_MGMT_ENVIRONMENT: ${VAULT_MGMT_ENVIRONMENT}
+      VAULT_MGMT_LOG_LEVEL: ${VAULT_MGMT_LOG_LEVEL}
+      VAULT_MGMT_API_PREFIX: ${VAULT_MGMT_API_PREFIX}
+      # Dentro de la red se usan nombres de servicio y puertos de contenedor.
+      VAULT_MGMT_POSTGRES_HOST: postgres-service
+      VAULT_MGMT_POSTGRES_PORT: ${POSTGRES_PORT_REMOTE}
+      VAULT_MGMT_POSTGRES_DB: ${POSTGRES_DB}
+      VAULT_MGMT_POSTGRES_USER: ${POSTGRES_APP_USER}
+      VAULT_MGMT_POSTGRES_SCHEMA: ${VAULT_MGMT_POSTGRES_SCHEMA}
+      VAULT_MGMT_POSTGRES_EMPLOYEES_SCHEMA: ${POSTGRES_SCHEMA}
+      VAULT_MGMT_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_app_password
+      VAULT_MGMT_VAULT_ADDR: http://vault-service:${VAULT_PORT_REMOTE}
+      VAULT_MGMT_KV_MOUNT: ${VAULT_MGMT_KV_MOUNT}
+      VAULT_MGMT_KV_PREFIX: ${VAULT_MGMT_KV_PREFIX}
+      VAULT_MGMT_USER_MGMT_BASE_URL: http://user-mgmt-service:${USER_MGMT_PORT_REMOTE}
+      VAULT_MGMT_INTERNAL_CREDENTIAL_FILE: /run/secrets/vault_mgmt_internal_token
+      VAULT_MGMT_WRAP_TTL_SECONDS: ${VAULT_MGMT_WRAP_TTL_SECONDS}
+      VAULT_MGMT_MAX_COLLECTION_BATCH: ${VAULT_MGMT_MAX_COLLECTION_BATCH}
+      VAULT_MGMT_MAX_VERSIONS_PER_REQUEST: ${VAULT_MGMT_MAX_VERSIONS_PER_REQUEST}
+      VAULT_MGMT_MAX_CRAWLER_RECORDS: ${VAULT_MGMT_MAX_CRAWLER_RECORDS}
+      VAULT_MGMT_MAX_RECORD_BYTES: ${VAULT_MGMT_MAX_RECORD_BYTES}
+      VAULT_MGMT_RATE_LIMIT_SESSION_PER_MINUTE: ${VAULT_MGMT_RATE_LIMIT_SESSION_PER_MINUTE}
+      VAULT_MGMT_RATE_LIMIT_CONSUMER_PER_MINUTE: ${VAULT_MGMT_RATE_LIMIT_CONSUMER_PER_MINUTE}
+      VAULT_MGMT_RATE_LIMIT_GLOBAL_PER_MINUTE: ${VAULT_MGMT_RATE_LIMIT_GLOBAL_PER_MINUTE}
+    secrets:
+      - postgres_app_password
+      - vault_mgmt_internal_token
+    ports:
+      # Solo loopback del host, igual que los demas.
+      - "${VAULT_MGMT_HOST_BIND}:${VAULT_MGMT_PORT_LOCAL}:${VAULT_MGMT_PORT_REMOTE}"
+    networks:
+      - ${DOCKER_NETWORK_NAME}
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres-service:
+        condition: service_healthy
+      # Vault y user-mgmt van con service_started, NO service_healthy:
+      #   * Vault arranca sellado y el unseal es manual.
+      #   * user-mgmt puede estar vivo pero no listo por ese mismo motivo.
+      # Exigir salud aqui crearia un arranque en cadena imposible de
+      # diagnosticar. Readiness lo refleja con 503 y dice que falta.
+      vault-service:
+        condition: service_started
+      user-mgmt-service:
+        condition: service_started
+    healthcheck:
+      # /health/live, no /health/ready: el contenedor esta sano aunque Vault
+      # siga sellado o la pasarela no responda todavia.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/health/live', timeout=3).status==200 else 1)\""]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -163,3 +242,9 @@ secrets:
     file: ./secrets/vault_role_id
   vault_secret_id:
     file: ./secrets/vault_secret_id
+  # Credencial INTERNA entre vault-mgmt-service y la pasarela de
+  # user-mgmt-service, creada por
+  # scripts/vault_mgmt/prepare-internal-secret.sh. Es independiente del Bearer
+  # humano y no lo sustituye: las dos son obligatorias.
+  vault_mgmt_internal_token:
+    file: ./secrets/vault_mgmt_internal_token

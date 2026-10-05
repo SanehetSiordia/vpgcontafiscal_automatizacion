@@ -118,3 +118,61 @@ COPY --chown=vpg:vpg pytest.ini /app/pytest.ini
 RUN find /app/tests -name '*.py' -exec sed -i 's/\r$//' {} +
 USER vpg
 CMD ["python", "-m", "pytest"]
+
+# =============================================================================
+# Componente 4: vault-mgmt-service (FastAPI) - CRUD dinamico de secretos
+# =============================================================================
+
+# Etapa builder: igual que la de user-mgmt y por el mismo motivo. En musl varias
+# dependencias no publican rueda (psycopg-c, uvloop, httptools, pydantic-core) y
+# hay que compilarlas aqui, no en el runtime.
+FROM python:${PYTHON_VERSION} AS vault-mgmt-builder
+RUN apk add --no-cache build-base musl-dev postgresql-dev libffi-dev
+COPY requirements/vault_mgmt.txt /tmp/vault_mgmt.txt
+RUN python -m pip install --no-cache-dir --upgrade pip wheel \
+ && python -m pip wheel --no-cache-dir --wheel-dir /wheels -r /tmp/vault_mgmt.txt
+
+# Etapa final: solo la biblioteca de cliente de PostgreSQL en tiempo de
+# ejecucion. Sin compiladores, sin cabeceras, sin cache de pip, usuario no root.
+FROM python:${PYTHON_VERSION} AS vault-mgmt-server
+RUN apk add --no-cache libpq \
+ && addgroup -S vpg && adduser -S -G vpg -h /app vpg
+COPY --from=vault-mgmt-builder /wheels /wheels
+COPY requirements/vault_mgmt.txt /tmp/vault_mgmt.txt
+RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels \
+      -r /tmp/vault_mgmt.txt \
+ && rm -rf /wheels /tmp/vault_mgmt.txt /root/.cache
+
+WORKDIR /app
+# El codigo va EN la imagen: no hay volumen persistente de codigo.
+# Se copia el arbol `app/` completo porque vault_mgmt reutiliza modulos de la
+# etapa 3 (app/core/errors.py, logging.py, rate_limit.py, vault.py, vault_kv.py
+# y secret_schema.py). Lo que NO se hace es importar app.main: cada servicio
+# tiene el suyo y no comparten estado en memoria.
+COPY --chown=vpg:vpg app/ /app/app/
+# Normaliza CRLF por si Git los convirtio en Windows.
+RUN find /app/app -name '*.py' -exec sed -i 's/\r$//' {} + \
+ && python -m compileall -q /app/app \
+ && chown -R vpg:vpg /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+USER vpg
+EXPOSE 8001
+# Un worker y sin reload, igual que user-mgmt.
+CMD ["uvicorn", "app.vault_mgmt.main:app", \
+     "--host", "0.0.0.0", "--port", "8001", \
+     "--workers", "1", "--no-access-log", "--proxy-headers"]
+
+# Etapa de PRUEBAS de la etapa 4. No se publica; se construye a demanda con
+# `--target vault-mgmt-test`.
+FROM vault-mgmt-server AS vault-mgmt-test
+USER root
+COPY requirements/vault_mgmt-dev.txt /tmp/dev.txt
+RUN python -m pip install --no-cache-dir -r /tmp/dev.txt && rm -f /tmp/dev.txt
+COPY --chown=vpg:vpg tests/ /app/tests/
+COPY --chown=vpg:vpg pytest.ini /app/pytest.ini
+RUN find /app/tests -name '*.py' -exec sed -i 's/\r$//' {} +
+USER vpg
+CMD ["python", "-m", "pytest", "tests/vault_mgmt"]

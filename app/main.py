@@ -35,11 +35,14 @@ from app.core.rate_limit import SlidingWindowLimiter
 from app.core.readiness import ReadinessState, StartupPreconditionError, verify_admin_anchor
 from app.core.security import SessionStore
 from app.core.vault import VaultClient, VaultError, VaultSealed, VaultUnavailable
+from app.core.vault_kv import KvV2Client
 from app.routers import auth as auth_router
 from app.routers import health as health_router
+from app.routers import internal as internal_router
 from app.routers import users as users_router
 from app.routers import vault_ops as vault_router
 from app.services.auth import AuthService
+from app.services.vault_gateway import VaultGatewayService
 from app.services.vault_sync import VaultSyncService
 
 logger = get_logger("app.main")
@@ -90,6 +93,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         challenge_ttl_seconds=settings.challenge_ttl_seconds,
         max_sessions=settings.max_sessions,
         max_challenges=settings.max_challenges,
+        mfa_proof_ttl_seconds=settings.mfa_proof_ttl_seconds,
+        max_mfa_proofs=settings.max_mfa_proofs,
     )
     app.state.limiter = SlidingWindowLimiter()
     app.state.auth_service = AuthService(
@@ -101,6 +106,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.vault_sync = VaultSyncService(
         vault=vault, settings=settings, session_factory=session_factory
+    )
+    # Pasarela interna de la etapa 4. El cliente KV se construye por montaje y
+    # el montaje sale del catalogo, nunca del cuerpo de una peticion.
+    app.state.vault_gateway = VaultGatewayService(
+        settings=settings,
+        session_factory=session_factory,
+        sessions=app.state.sessions,
+        kv_factory=lambda mount: KvV2Client(
+            base_url=settings.vault_addr,
+            mount=mount,
+            timeout_seconds=settings.vault_timeout_seconds,
+        ),
     )
 
     # --- precondicion que NO se arregla sola --------------------------------
@@ -160,6 +177,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for victim in victims:
             with contextlib.suppress(Exception):
                 await vault.revoke_self(victim.vault_token)
+        await app.state.vault_gateway.aclose()
         await vault.aclose()
         await dispose_engine()
         logger.info("cierre completado", extra={"operation": "shutdown"})
@@ -169,7 +187,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title=settings.app_name,
-        version="0.3.0",
+        version="0.4.0",
         description=DESCRIPTION,
         lifespan=lifespan,
         openapi_tags=[
@@ -330,6 +348,9 @@ def create_app() -> FastAPI:
     app.include_router(auth_router.router, prefix=prefix)
     app.include_router(users_router.router, prefix=prefix)
     app.include_router(vault_router.router, prefix=prefix)
+    # Pasarela interna: fuera del OpenAPI publico y con credencial de servicio
+    # propia, ademas del Bearer humano. Su acceso se restringe en el despliegue.
+    app.include_router(internal_router.router)
     return app
 
 

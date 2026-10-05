@@ -113,6 +113,28 @@ class Settings(BaseSettings):
     # Antiguedad maxima del MFA para operaciones sensibles (reset TOTP, purga).
     sensitive_op_mfa_max_age_seconds: Annotated[int, Field(ge=60, le=3600)] = 900
 
+    # --- Pasarela interna de vault-mgmt-service (etapa 4) -------------------
+    # Credencial interna INDEPENDIENTE del Bearer humano, suministrada por
+    # archivo de Compose secret. No sustituye la autorizacion de la persona:
+    # ambas son obligatorias. La red de Docker por si sola no autentica a nadie.
+    internal_credential_file: str = "/run/secrets/vault_mgmt_internal_token"
+    internal_credential_header: str = "X-VPG-Internal-Credential"
+    # Cabecera con la prueba breve de MFA reciente que emite el step-up.
+    mfa_proof_header: str = "X-VPG-MFA-Proof"
+    # Vida de esa prueba. Corta a proposito: autoriza UNA operacion registrada
+    # sobre un conjunto cerrado de recursos, no acciones ilimitadas.
+    mfa_proof_ttl_seconds: Annotated[int, Field(ge=30, le=900)] = 300
+    max_mfa_proofs: Annotated[int, Field(ge=1, le=1000)] = 50
+    # Esquema del catalogo compartido que la pasarela consulta en SOLO LECTURA
+    # para resolver el path fisico de una coleccion o registro.
+    catalog_schema: str = "vault_mgmt"
+    # TTL del response wrapping con el que se entregan los valores.
+    wrap_ttl_seconds: Annotated[int, Field(ge=10, le=600)] = 60
+    # Tope de versiones por operacion explicita de versiones.
+    max_versions_per_request: Annotated[int, Field(ge=1, le=100)] = 20
+    # Tope de registros que un lote de coleccion procesa de una vez.
+    max_collection_batch: Annotated[int, Field(ge=1, le=1000)] = 100
+
     # --- Readiness ----------------------------------------------------------
     readiness_recheck_seconds: Annotated[int, Field(ge=2, le=300)] = 15
 
@@ -166,6 +188,21 @@ class Settings(BaseSettings):
         )
         assert secret is not None
         return secret
+
+    @functools.cached_property
+    def internal_credential(self) -> SecretStr | None:
+        """Credencial de la pasarela interna. Puede faltar: readiness lo dice.
+
+        No se inventa un valor por defecto. Sin ella, ``/internal/v1/...``
+        rechaza toda peticion con 503 en vez de quedar abierto.
+        """
+        return _read_secret_file(
+            self.internal_credential_file, label="credencial interna", required=False
+        )
+
+    @property
+    def has_internal_credential(self) -> bool:
+        return self.internal_credential is not None
 
     @functools.cached_property
     def vault_role_id(self) -> SecretStr | None:
