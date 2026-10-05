@@ -116,7 +116,7 @@ if [ -z "$MFA_METHOD_ID" ]; then
   log "Creando metodo MFA TOTP '${MFA_METHOD_NAME}'"
   # SHA1/6 digitos/30 s: compatible con Google/Microsoft Authenticator, Authy, etc.
   MFA_METHOD_ID=$(vault write -field=method_id identity/mfa/method/totp \
-    method_name="$MFA_METHOD_NAME" issuer="VPG Vault" \
+    method_name="$MFA_METHOD_NAME" issuer="VPG_Vault" \
     period=30 key_size=20 algorithm=SHA1 digits=6 qr_size=200 \
     max_validation_attempts=5)
 fi

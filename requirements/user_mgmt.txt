@@ -1,0 +1,40 @@
+# Dependencias de ejecucion de user-mgmt-service (FastAPI).
+# Versiones FIJADAS: una reconstruccion da la misma imagen.
+#
+# Nota sobre python:3.12-alpine (musl): varios de estos paquetes NO publican
+# rueda para musl y se compilan. Por eso el Dockerfile los construye en la etapa
+# `user-mgmt-builder` (con gcc, musl-dev y postgresql-dev) y el runtime solo
+# instala las ruedas ya construidas sobre `libpq`, sin compiladores ni caches.
+#
+# Se evita a proposito `uvicorn[standard]`: arrastra `watchfiles`, que exige
+# cadena de compilacion de Rust y solo hace falta para --reload, que este
+# servicio no usa. uvloop y httptools se declaran de forma explicita.
+
+fastapi==0.142.2
+# Starlette se fija de forma EXPLICITA aunque llegue como dependencia de
+# FastAPI: el escaneo de la imagen encontro 3 vulnerabilidades HIGH en
+# starlette 0.41.3 (la que arrastraba fastapi 0.115.6). Fijarla aqui hace
+# visible la version que realmente se instala.
+starlette==1.7.0
+uvicorn==0.54.0
+uvloop==0.23.0
+httptools==0.8.0
+
+sqlalchemy[asyncio]==2.1.3
+# Implementacion C, compilada en la etapa builder. Dos cosas comprobadas en este
+# proyecto, no supuestas:
+#   * psycopg[binary] NO publica rueda para musl (Alpine): no es una opcion.
+#   * psycopg[c]==3.2.3 NO compila con el gcc 15 de Alpine 3.22 (numutils.c
+#     declara UINT64CONST(10000000000000000000) y gcc 15 lo rechaza por
+#     desbordamiento). 3.2.13 si compila.
+# Tampoco sirve la implementacion PURA de Python aqui: resuelve libpq con
+# ctypes.util.find_library("pq"), que en musl devuelve None porque no hay
+# ldconfig ni ld, y psycopg aborta con "libpq library not found". Meter binutils
+# en el runtime solo para eso seria peor. La variante C enlaza libpq de forma
+# normal y el runtime solo necesita el paquete `libpq`.
+psycopg[c,pool]==3.2.13
+
+pydantic==2.13.5
+pydantic-settings==2.15.0
+
+httpx==0.28.1

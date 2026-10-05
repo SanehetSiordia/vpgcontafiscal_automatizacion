@@ -1,0 +1,7 @@
+# Dependencias SOLO de pruebas. No entran en la imagen de runtime.
+# Se instalan sobre las de user_mgmt.txt:
+#   pip install -r requirements/user_mgmt.txt -r requirements/user_mgmt-dev.txt
+
+pytest==8.4.2
+pytest-asyncio==1.3.0
+anyio==4.15.1

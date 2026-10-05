@@ -224,3 +224,14 @@ __marimo__/
 .vault-token
 *.unseal
 vault-init*.txt
+
+#entorno visual Code
+.vscode/
+# VPG Contadores - PostgreSQL
+# Compose secrets: contrasenas de las cuentas de PostgreSQL. Nunca al repositorio.
+secrets/
+*.pgpass
+.pgpass
+
+#Paths
+postman/*

@@ -1,4 +1,10 @@
 ARG VAULT_VERSION=2.1.1
+ARG POSTGRES_VERSION=17-alpine
+ARG PYTHON_VERSION=3.12-alpine
+
+# =============================================================================
+# Componente 1: HashiCorp Vault
+# =============================================================================
 
 # Etapa 1: prepara los archivos del proyecto.
 # Normaliza finales de linea (Git en Windows puede convertirlos a CRLF)
@@ -29,3 +35,86 @@ VOLUME ["/vault/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD vault status >/dev/null 2>&1; [ $? -ne 1 ]
 ENTRYPOINT ["/usr/local/bin/vpg-entrypoint.sh"]
+
+# =============================================================================
+# Componente 2: PostgreSQL 17 (empleados, roles y vinculo con Vault)
+# =============================================================================
+
+# Etapa 1: normaliza CRLF y permisos del DDL y de los scripts, igual que en
+# Vault. No se instala Python ni ninguna dependencia adicional.
+FROM postgres:${POSTGRES_VERSION} AS postgres-assets
+USER root
+COPY sql/001_employees.sql            /staging/opt/vpg/sql/001_employees.sql
+COPY scripts/postgres/pg-schema.sh    /staging/usr/local/bin/vpg-pg-schema
+COPY scripts/postgres/pg-app-role.sh  /staging/usr/local/bin/vpg-pg-roles
+RUN sed -i 's/\r$//' /staging/opt/vpg/sql/001_employees.sql \
+      /staging/usr/local/bin/vpg-pg-schema /staging/usr/local/bin/vpg-pg-roles \
+ && chmod 0644 /staging/opt/vpg/sql/001_employees.sql \
+ && chmod 0755 /staging/usr/local/bin/vpg-pg-schema /staging/usr/local/bin/vpg-pg-roles
+
+# Etapa final: se CONSERVA el entrypoint y el CMD oficiales de postgres
+# (no se declaran ENTRYPOINT ni CMD aqui).
+FROM postgres:${POSTGRES_VERSION} AS postgres-server
+COPY --from=postgres-assets /staging/opt/vpg/       /opt/vpg/
+COPY --from=postgres-assets /staging/usr/local/bin/ /usr/local/bin/
+# Los enlaces en /docker-entrypoint-initdb.d solo los ejecuta el entrypoint
+# oficial cuando el volumen de datos esta VACIO. Los mismos scripts se pueden
+# invocar a mano en cualquier momento (vpg-pg-schema / vpg-pg-roles).
+RUN ln -sf /usr/local/bin/vpg-pg-schema /docker-entrypoint-initdb.d/10-schema.sh \
+ && ln -sf /usr/local/bin/vpg-pg-roles  /docker-entrypoint-initdb.d/20-app-role.sh
+EXPOSE 5432
+VOLUME ["/var/lib/postgresql/data"]
+
+# =============================================================================
+# Componente 3: user-mgmt-service (FastAPI)
+# =============================================================================
+
+# Etapa builder: aqui viven gcc y las cabeceras. Varias dependencias no publican
+# rueda para musl (psycopg-c, uvloop, httptools, pydantic-core) y se compilan.
+FROM python:${PYTHON_VERSION} AS user-mgmt-builder
+RUN apk add --no-cache build-base musl-dev postgresql-dev libffi-dev
+COPY requirements/user_mgmt.txt /tmp/user_mgmt.txt
+RUN python -m pip install --no-cache-dir --upgrade pip wheel \
+ && python -m pip wheel --no-cache-dir --wheel-dir /wheels -r /tmp/user_mgmt.txt
+
+# Etapa final: solo la biblioteca de cliente de PostgreSQL en tiempo de
+# ejecucion. Sin compiladores, sin cabeceras, sin cache de pip.
+FROM python:${PYTHON_VERSION} AS user-mgmt-server
+RUN apk add --no-cache libpq \
+ && addgroup -S vpg && adduser -S -G vpg -h /app vpg
+COPY --from=user-mgmt-builder /wheels /wheels
+COPY requirements/user_mgmt.txt /tmp/user_mgmt.txt
+RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels \
+      -r /tmp/user_mgmt.txt \
+ && rm -rf /wheels /tmp/user_mgmt.txt /root/.cache
+
+WORKDIR /app
+# El codigo va EN la imagen: no hace falta volumen persistente para /app.
+COPY --chown=vpg:vpg app/ /app/app/
+# Normaliza CRLF por si Git los convirtio en Windows.
+RUN find /app/app -name '*.py' -exec sed -i 's/\r$//' {} + \
+ && python -m compileall -q /app/app \
+ && chown -R vpg:vpg /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+USER vpg
+EXPOSE 8000
+# Un worker y sin reload: las sesiones viven en memoria del proceso.
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--no-access-log", "--proxy-headers"]
+
+# Etapa de PRUEBAS: parte del runtime y le anade solo las dependencias de test.
+# No forma parte de la imagen que se publica; se construye a demanda con
+# `--target user-mgmt-test`.
+FROM user-mgmt-server AS user-mgmt-test
+USER root
+COPY requirements/user_mgmt-dev.txt /tmp/dev.txt
+RUN python -m pip install --no-cache-dir -r /tmp/dev.txt && rm -f /tmp/dev.txt
+COPY --chown=vpg:vpg tests/ /app/tests/
+COPY --chown=vpg:vpg pytest.ini /app/pytest.ini
+RUN find /app/tests -name '*.py' -exec sed -i 's/\r$//' {} +
+USER vpg
+CMD ["python", "-m", "pytest"]
