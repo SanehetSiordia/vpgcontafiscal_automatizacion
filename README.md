@@ -1127,6 +1127,7 @@ endpoint de negocio.
 | `requirements/user_mgmt.txt` | Dependencias de ejecución, fijadas |
 | `requirements/user_mgmt-dev.txt` | Dependencias **solo** de pruebas |
 | `tests/` | 91 pruebas pytest |
+| `postman/` | Colección y environment de Postman: 44 peticiones, 19 variables |
 
 ### Requerimientos: dependencias y por qué cada una
 
@@ -1672,6 +1673,156 @@ vpg-postgres-data, vpg-vault-data                  <- intactos
 
 Las **sesiones en memoria sí se pierden** al reiniciar el worker: es el límite
 documentado del diseño de un solo worker.
+
+---
+
+## Colección de Postman
+
+Dos archivos en `postman/`, generados a partir del **OpenAPI real** de
+`http://127.0.0.1:8000/openapi.json`:
+
+| Archivo | Contenido |
+|---|---|
+| `vpg-user-mgmt.postman_collection.json` | 4 carpetas, **44 peticiones**, 119 aserciones `pm.test` |
+| `vpg-user-mgmt.postman_environment.json` | **19 variables** de entorno |
+
+Cada uno de los **21 endpoints** tiene dos peticiones: una **· Ejemplo**
+(camino feliz) y una **· Prueba** (validación, permiso o error esperado). Las
+tres excepciones añaden una tercera: `PATCH /user/{id}` lleva una prueba extra
+de «modificar por id, no recrear», y `DELETE /user/{id}` una verificación del
+estado tras la baja.
+
+### Importar
+
+En Postman: **Import** → arrastra los dos archivos → selecciona el environment
+**«VPG user-mgmt (local)»** en el desplegable de la esquina superior derecha.
+
+### Dónde va el `Authorization: Bearer <api_session>`
+
+Si una petición devuelve esto:
+
+```json
+{
+  "code": "unauthenticated",
+  "message": "falta la cabecera Authorization: Bearer <api_session>",
+  "request_id": "46a9ccc332934975bc438062dd58ac38",
+  "context": {}
+}
+```
+
+es que salió sin la cabecera. **No hay que escribirla a mano en ninguna
+petición.** Está configurada una sola vez, en tres piezas:
+
+| Dónde | Qué poner |
+|---|---|
+| **Colección → pestaña `Authorization`** | Type: **Bearer Token** · Token: `{{api_session}}` |
+| **Cada petición → pestaña `Authorization`** | **Inherit auth from parent** (es el valor por defecto; no hay que tocar nada) |
+| **Environment → `api_session`** | Se rellena **sola**: la escribe el script de `POST /auth/mfa/verify` |
+
+Las únicas peticiones con **No Auth** son las 4 de salud, el login y la
+verificación MFA —en ese momento aún no existe sesión—, y
+`GET /auth/me · Prueba (401 sin Authorization)`, que lleva No Auth **a
+propósito** para reproducir ese error.
+
+### Puesta en marcha
+
+1. Rellena `admin_username` y `admin_password` (los de `VAULT_ADMIN_USER_NAME`
+   y `VAULT_ADMIN_USER_PASS` en `.env`).
+2. Lanza `00 · Salud → GET /health/ready`. Si da **503**, desbloquea Vault:
+   `docker compose exec vault-service vault operator unseal`.
+3. Lanza `01 → POST /auth/login · Ejemplo`. Guarda `challenge_id`; todavía **no
+   hay sesión**.
+4. Pon el código de 6 dígitos del autenticador en **`totp_code`** y lanza
+   `01 → POST /auth/mfa/verify · Ejemplo` **enseguida**: el código dura 30 s y
+   el desafío 180 s.
+5. A partir de ahí, las carpetas 02 y 03 funcionan solas.
+
+> El `api_session` caduca (1 h) y **se pierde al reiniciar el contenedor**,
+> porque las sesiones viven en memoria del único worker. Si empiezan los 401,
+> repite los pasos 3-4.
+
+### Variables del environment
+
+| Variable | Tipo | Origen | Para qué |
+|---|---|---|---|
+| `base_url` | fija | `http://127.0.0.1:8000` | Ajústala si cambiaste `USER_MGMT_PORT_LOCAL` |
+| `api_prefix` | fija | `/user_mgmt/v1` | Debe coincidir con `USER_MGMT_API_PREFIX` |
+| `admin_username` | **rellenar** | — | Usuario userpass, en minúsculas |
+| `admin_password` | **rellenar**, secret | — | Contraseña de Vault |
+| `totp_code` | **rellenar**, secret | — | Código de 6 dígitos, justo antes del paso 4 |
+| `challenge_id` | automática, secret | `/auth/login` | Desafío MFA, TTL 180 s |
+| `api_session` | automática, secret | `/auth/mfa/verify` | **Lo que se manda como Bearer** |
+| `mi_user_id` | automática | `/auth/mfa/verify` | Tu propio UUID (autopurga, último admin) |
+| `user_id` | automática | `POST /user` | Empleado de prueba |
+| `operation_id` | automática | operaciones Vault | Para consultar fases |
+| `phone_id` | automática | `PATCH /user/{id}` | Para modificar un contacto por su id |
+| `demo_username`, `demo_email` | automáticas | `POST /user` | Se regeneran con sufijo de tiempo, para poder repetir el alta |
+| `demo_birth_date` | fija | `1991-03-20` | Formato `YYYY-MM-DD` |
+| `provision_password`, `provision_password_nueva` | fijas, secret | ficticias | Provisionamiento y cambio de credenciales |
+| `vault_resource` | fija | `crawler_sat` | Nombre **lógico** de la allowlist, no una ruta |
+| `page_limit` | fija | `20` | Elementos por página |
+| `uuid_inexistente` | fija | `00000000-…-999` | Para las pruebas de 404 |
+
+Las marcadas `secret` las oculta Postman en la interfaz y no viajan en los
+exports compartidos.
+
+### Ejecutar la colección entera
+
+Orden: `00` → `01` → `02` → `03`. Avisos antes de darle al Runner:
+
+- `01 → mfa/verify · Prueba` **gasta uno de los 5 intentos** de
+  `max_validation_attempts` del método TOTP.
+- `01 → logout · Ejemplo` invalida la sesión: déjalo para el final.
+- `02 → PUT …/roles · Prueba` intenta quitarte el rol admin. Devuelve 409 si
+  eres el último admin activo; si hay más de uno, **lo conseguirá**.
+- `02 → DELETE …/purge · Ejemplo` borra de verdad al empleado de prueba, en
+  Vault y en PostgreSQL. Es un usuario ficticio que crea la propia colección.
+- `03` necesita que `02 → POST /user · Ejemplo` haya corrido antes y que la
+  purga **no**.
+
+También se puede lanzar sin interfaz, con Newman en Docker:
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm --network network-service \
+  -v "$(pwd -W)/postman:/etc/newman:ro" \
+  postman/newman:alpine run /etc/newman/vpg-user-mgmt.postman_collection.json \
+  -e /etc/newman/vpg-user-mgmt.postman_environment.json \
+  --env-var base_url=http://user-mgmt-service:8000 \
+  --folder "00 · Salud (sin Authorization)"
+```
+
+Dentro de la red se usa `http://user-mgmt-service:8000`, no el puerto publicado
+en el host.
+
+**Resultado real** de esa carpeta:
+
+```
+↳ GET /health/ready · Ejemplo
+  GET http://user-mgmt-service:8000/health/ready [200 OK, 409B, 9ms]
+  ✓  Respuesta con X-Request-ID
+  ✓  Responde 200 o 503
+  ✓  Informa las cinco comprobaciones
+
+  requests 4 | test-scripts 8 | assertions 14 | failed 0
+```
+
+Y la petición que reproduce el 401 del principio:
+
+```
+↳ GET /auth/me · Prueba (401 sin Authorization)
+  GET .../user_mgmt/v1/auth/me [401 Unauthorized, 337B, 69ms]
+  ✓  Responde 401
+  ✓  code = unauthenticated
+  ✓  El error trae request_id
+  ✓  El mensaje indica como arreglarlo
+```
+
+### Lo que la colección nunca guarda
+
+El URI `otpauth://` que devuelve el provisionamiento **no** se escribe en
+ninguna variable de entorno, a propósito: es un secreto de un solo uso que se
+entrega una vez y no vuelve a aparecer en ningún GET. El token de Vault tampoco,
+porque no sale del servidor.
 
 ---
 

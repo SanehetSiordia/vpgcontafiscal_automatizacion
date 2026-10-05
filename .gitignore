@@ -232,3 +232,6 @@ vault-init*.txt
 secrets/
 *.pgpass
 .pgpass
+
+#Paths
+postman/*

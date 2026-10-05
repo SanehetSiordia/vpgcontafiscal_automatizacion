@@ -19,3 +19,6 @@
 .git
 secrets/
 secrets/**
+
+#Paths
+postman/*
