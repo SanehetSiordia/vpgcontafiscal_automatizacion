@@ -586,8 +586,8 @@ operación. Para inspeccionar en vivo:
 
 ```bash
 bash scripts/user_mgmt/reconcile-operations.sh list
-bash scripts/user_mgmt/reconcile-operations.sh inspect <operation_id>
-bash scripts/user_mgmt/reconcile-operations.sh close <operation_id> "resuelto a mano"
+bash scripts/user_mgmt/reconcile-operations.sh inspect '<operation_id>'
+bash scripts/user_mgmt/reconcile-operations.sh close '<operation_id>' "resuelto a mano"
 ```
 
 ### 8. Persistencia al recrear solo la API

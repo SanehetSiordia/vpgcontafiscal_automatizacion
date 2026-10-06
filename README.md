@@ -75,6 +75,7 @@ aquí solo está la secuencia y dónde buscarla.
 | 5 | AppRole y política de `user-mgmt`, migraciones 001 y 002 | [etapa 3](readme/etapa-3-user-mgmt-service.md#comprobaciones-reproducibles-etapa-3) |
 | 6 | Migración 003, credencial interna y políticas KV del catálogo | [etapa 4](readme/etapa-4-vault-mgmt-service.md#1-preparación-por-cli) |
 | 7 | `docker compose up -d` y comprobar salud de las dos APIs | [etapa 4](readme/etapa-4-vault-mgmt-service.md#3-arrancar) |
+| 8 | Recorrido interactivo de comprobación: `bash scripts/vault_mgmt/walkthrough.sh` | [etapa 4](readme/etapa-4-vault-mgmt-service.md#6--interactivo--recorrido-crud-completo) |
 
 > **Tras cada reinicio de Vault hay que volver a desbloquearlo.** Es un paso
 > manual a propósito: ninguna de las dos APIs hace `unseal`. Mientras siga
@@ -97,6 +98,7 @@ aquí solo está la secuencia y dónde buscarla.
 | Mapeo rol de aplicación ↔ política de Vault | [etapa 4](readme/etapa-4-vault-mgmt-service.md#permisos-y-mapeo-rol--política-de-vault) |
 | Entrega de secretos y qué **no** es el response wrapping | [etapa 4](readme/etapa-4-vault-mgmt-service.md#entrega-de-secretos) |
 | Contrato del futuro crawler | [etapa 4](readme/etapa-4-vault-mgmt-service.md#contrato-del-futuro-crawler-una-máquina-independiente) |
+| Recorrer el CRUD de secretos de punta a punta | [etapa 4 · comprobación 6](readme/etapa-4-vault-mgmt-service.md#6--interactivo--recorrido-crud-completo) (`walkthrough.sh`) |
 | Un fallo parcial y cómo reconciliarlo | [etapa 4 · comprobación 9](readme/etapa-4-vault-mgmt-service.md#9-fallo-parcial-y-reconciliación) |
 | Importar secretos que ya existían en Vault | [etapa 4 · comprobación 10](readme/etapa-4-vault-mgmt-service.md#10-inventario-e-importación-de-secretos-anteriores) |
 | Qué demuestra cada suite de pruebas y qué no | [etapa 3](readme/etapa-3-user-mgmt-service.md#pruebas-unitarias), [etapa 4](readme/etapa-4-vault-mgmt-service.md#pruebas-unitarias-etapa-4) |

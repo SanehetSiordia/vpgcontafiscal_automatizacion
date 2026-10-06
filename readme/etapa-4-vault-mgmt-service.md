@@ -35,7 +35,7 @@ peticiones a sitios externos.
 | `config/policies/vpg-secrets-admin.hcl` | Política KV v2 de administración, acotada al prefijo gestionado |
 | `config/policies/vpg-secrets-reader.hcl` | Política KV v2 de solo lectura |
 | `config/policies/vpg-crawler.hcl` | Política de la máquina: solo lectura |
-| `scripts/vault_mgmt/*` | Preparación por CLI: migraciones, políticas, credencial interna, consumidor, inventario, reconciliación, pruebas y humo |
+| `scripts/vault_mgmt/*` | Preparación por CLI (migraciones, políticas, credencial interna, consumidor), inventario, reconciliación, pruebas, humo y el **recorrido interactivo** `walkthrough.sh` |
 | `tests/vault_mgmt/*` | 155 pruebas: catálogo, registros, CAS, MFA, entrega, ciclo de vida, crawler y superficie de seguridad |
 | `postman/vpg-vault-mgmt.postman_collection.json` | Colección v2.1, **derivada del OpenAPI** |
 
@@ -455,10 +455,18 @@ van después del paso 4:
 # Políticas KV v2 acotadas al prefijo gestionado
 bash scripts/vault_mgmt/vault-kv-policies.sh
 
-# Asignarlas a quien corresponda (una persona por invocación)
-bash scripts/vault_mgmt/vault-kv-policies.sh --grant-admin  ada.admin
-bash scripts/vault_mgmt/vault-kv-policies.sh --grant-reader max.manager
-bash scripts/vault_mgmt/vault-kv-policies.sh --show         max.manager
+# Asignarlas a quien corresponda, una persona por invocación. Usa los
+# usuarios REALES de employees.user_vault_identity, no los de las pruebas:
+#   docker compose exec postgres-service psql -U vpg_admin -d vpg_contadores -c "
+#   SELECT u.username, string_agg(r.code, ',') AS roles, i.vault_username
+#     FROM employees.users u
+#     JOIN employees.user_roles ur ON ur.user_id = u.id
+#     JOIN employees.roles r ON r.id = ur.role_id
+#     LEFT JOIN employees.user_vault_identity i ON i.user_id = u.id
+#    WHERE u.is_active GROUP BY 1, 3 ORDER BY 1;"
+bash scripts/vault_mgmt/vault-kv-policies.sh --grant-admin  '<usuario-admin>'
+bash scripts/vault_mgmt/vault-kv-policies.sh --grant-reader '<usuario-manager>'
+bash scripts/vault_mgmt/vault-kv-policies.sh --show         '<usuario-manager>'
 
 # Identidad de máquina del futuro crawler (AppRole dedicada, solo lectura)
 bash scripts/vault_mgmt/crawler-approle-bootstrap.sh
@@ -565,27 +573,118 @@ credencial correcta, sin Bearer: HTTP 401 (o 503 si Vault sigue sellado)
 
 ### 6. 🖐 INTERACTIVO — Recorrido CRUD completo
 
-Necesita un código TOTP de una persona, así que no se automatiza. La sesión se
-obtiene en user-mgmt (etapa 3) y se usa aquí.
+Necesita códigos TOTP de una persona, así que no se automatiza. La forma
+recomendada es el script, igual que en la etapa 3:
 
 ```bash
+bash scripts/vault_mgmt/walkthrough.sh
+bash scripts/vault_mgmt/walkthrough.sh --keep   # conserva la colección de prueba
+```
+
+El usuario administrador y su contraseña salen de `VAULT_ADMIN_USER_NAME` y
+`VAULT_ADMIN_USER_PASS` del `.env`: **no hay ningún usuario escrito en el
+código**, y la contraseña viaja por stdin, nunca como argumento visible ni en el
+historial. El código TOTP se teclea oculto, con un `#` por dígito.
+
+> **Harán falta tres códigos TOTP distintos** (dos con `--keep`): uno para el
+> login y uno por cada operación irreversible, porque la prueba de MFA es de un
+> solo uso y Vault no admite reutilizar un código. Si el autenticador sigue
+> mostrando el anterior, espera a que cambie.
+
+Demuestra, en este orden y con datos ficticios: que crear una colección no
+escribe nada en Vault; dos registros que son dos secretos independientes; el CAS
+que impide sobrescribir el cambio ajeno; un `PATCH` donde lo omitido se conserva
+y `null` elimina; un `null` sobre un campo obligatorio que responde 422 sin
+escribir; la entrega envuelta y su consumo único; el renombrado que conserva
+UUID, path e historial; un esquema incompatible que no crea versión; la
+capacidad efectiva; los tres estados de una versión; la purga con
+reautenticación y el rechazo al reutilizar la prueba; y la auditoría sin
+valores.
+
+Al final cierra la sesión y purga los fixtures, salvo con `--keep`.
+
+#### El mismo recorrido a mano
+
+Si prefieres ir paso a paso, esto es lo mismo con `curl`. **El paso 0 no es
+opcional:** sin él, `curl` recibe una URL vacía, no imprime nada y el `python`
+siguiente falla con un `JSONDecodeError` que no dice nada del problema real.
+
+```bash
+# --- paso 0: variables y comprobación previa -------------------------------
 UM=http://127.0.0.1:8000/user_mgmt/v1
 VM=http://127.0.0.1:8001/vault_mgmt/v1
+# Tu administrador real, el de employees.users. NO uses 'ada.admin': ese es el
+# fixture de las pruebas y solo existe en la base de pruebas.
+ADMIN=$(sed -n 's/^[[:space:]]*VAULT_ADMIN_USER_NAME=//p' .env | head -1 | tr -d '\r')
 
-# --- sesión (etapa 3) -------------------------------------------------------
-read -rsp "Contraseña de ada.admin: " PASS; echo
-CH=$(curl -s -X POST "$UM/auth/login" -H 'Content-Type: application/json' \
-     -d "{\"username\":\"ada.admin\",\"password\":\"$PASS\"}" \
-     | python -c 'import json,sys; print(json.load(sys.stdin)["challenge_id"])')
+# Si alguna falta, para aquí en vez de fallar tres comandos más adelante.
+: "${UM:?define UM}" "${VM:?define VM}" "${ADMIN:?falta VAULT_ADMIN_USER_NAME en .env}"
+curl -fsS http://127.0.0.1:8000/health/ready >/dev/null && echo "user-mgmt listo"
+curl -fsS http://127.0.0.1:8001/health/ready >/dev/null && echo "vault-mgmt listo"
+echo "administrador: $ADMIN"
+```
+
+Si una de las dos comprobaciones falla, mira su `detail`: lo habitual es que
+Vault siga sellado y el desbloqueo sea manual.
+
+```bash
+# --- paso 0b: ayudantes que fallan hablando --------------------------------
+# api <MÉTODO> <URL> [CUERPO] -> cuerpo en stdout, estado en $ESTADO.
+# Sustituye a `curl -s | python -c`, que ante cualquier error deja una traza
+# ilegible en vez del 401 o el 503 que de verdad ocurrió.
+api() {
+  local metodo=$1 url=$2 cuerpo=${3-}
+  local -a opciones=(-sS -X "$metodo" "$url" -H 'Content-Type: application/json')
+  [[ -n "${A:-}" ]] && opciones+=(-H "$A")
+  [[ -n "${P:-}" ]] && opciones+=(-H "X-VPG-MFA-Proof: $P")
+  [[ -n "$cuerpo" ]] && opciones+=(--data-binary "$cuerpo")
+  local respuesta
+  respuesta=$(curl -w $'\n%{http_code}' "${opciones[@]}" 2>&1) || true
+  ESTADO=${respuesta##*$'\n'}
+  respuesta=${respuesta%$'\n'*}
+  if [[ ! "$ESTADO" =~ ^2[0-9][0-9]$ ]]; then
+    printf 'ERROR: %s %s -> %s\n' "$metodo" "$url" "${ESTADO:-sin respuesta}" >&2
+    printf '%s\n' "$respuesta" >&2
+    return 1
+  fi
+  printf '%s' "$respuesta"
+}
+
+# jget "a.b.0.c" sobre stdin. Devuelve vacío si falta la clave.
+jget() { python -c "
+import json,sys
+crudo = sys.stdin.read()
+if not crudo.strip(): print(''); sys.exit(0)
+try: d = json.loads(crudo)
+except json.JSONDecodeError: print(''); sys.exit(0)
+for k in sys.argv[1].split('.'):
+    if d is None: break
+    d = d[int(k)] if k.isdigit() and isinstance(d, list) else (
+        d.get(k) if isinstance(d, dict) else None)
+print(d if d is not None else '')" "$1"; }
+```
+
+```bash
+# --- 1. sesión (etapa 3) ---------------------------------------------------
+read -rsp "Contraseña de $ADMIN: " PASS; echo
+CH=$(api POST "$UM/auth/login" \
+     "$(python -c "import json,sys;print(json.dumps({'username':sys.argv[1],'password':sys.argv[2]}))" \
+        "$ADMIN" "$PASS")" | jget challenge_id)
 unset PASS
-read -rp "Código TOTP: " CODE
-S=$(curl -s -X POST "$UM/auth/mfa/verify" -H 'Content-Type: application/json' \
-    -d "{\"challenge_id\":\"$CH\",\"code\":\"$CODE\"}" \
-    | python -c 'import json,sys; print(json.load(sys.stdin)["api_session"])')
-A="Authorization: Bearer $S"
+[[ -n "$CH" ]] || { echo "sin challenge_id: mira el error de arriba"; }
 
-# --- 1. crear la colección y su esquema ------------------------------------
-C=$(curl -s -X POST "$VM/vault/collections" -H "$A" -H 'Content-Type: application/json' -d '{
+read -rp "Código TOTP: " CODE
+S=$(api POST "$UM/auth/mfa/verify" \
+    "$(python -c "import json,sys;print(json.dumps({'challenge_id':sys.argv[1],'code':sys.argv[2]}))" \
+       "$CH" "$CODE")" | jget api_session)
+unset CODE
+A="Authorization: Bearer $S"
+[[ -n "$S" ]] && echo "sesión establecida"
+```
+
+```bash
+# --- 2. crear la colección y su esquema ------------------------------------
+C=$(api POST "$VM/vault/collections" '{
   "logical_name": "sat/usuarios-demo",
   "description": "Credenciales del portal del SAT (datos ficticios)",
   "reader_role_codes": ["admin", "manager"],
@@ -594,61 +693,85 @@ C=$(curl -s -X POST "$VM/vault/collections" -H "$A" -H 'Content-Type: applicatio
     {"name": "password", "type": "string", "required": true,  "sensitive": true, "max_length": 256},
     {"name": "rfc",      "type": "string", "required": false, "max_length": 13}
   ]
-}' | python -c 'import json,sys; d=json.load(sys.stdin); print(d["collection_id"])')
+}' | jget collection_id)
 echo "collection_id=$C"
 
-# --- 2. dos registros INDEPENDIENTES ---------------------------------------
-R1=$(curl -s -X POST "$VM/vault/collections/$C/records" -H "$A" \
-     -H 'Content-Type: application/json' -H "Idempotency-Key: demo-$RANDOM" -d '{
+# Crear la colección NO ha escrito nada en Vault: KV v2 no tiene carpetas
+docker compose exec vault-service vault kv list "secret/vpg-managed/$C"
+# "No value found": correcto, el prefijo todavía no existe
+```
+
+```bash
+# --- 3. dos registros INDEPENDIENTES ---------------------------------------
+R1=$(api POST "$VM/vault/collections/$C/records" '{
        "label": "contribuyente-uno",
        "values": {"usuario": "demo-uno", "password": "valor-ficticio-1"}
-     }' | python -c 'import json,sys; print(json.load(sys.stdin)["record_id"])')
-R2=$(curl -s -X POST "$VM/vault/collections/$C/records" -H "$A" \
-     -H 'Content-Type: application/json' -d '{
+     }' | jget record_id)
+R2=$(api POST "$VM/vault/collections/$C/records" '{
        "label": "contribuyente-dos",
        "values": {"usuario": "demo-dos", "password": "valor-ficticio-2"}
-     }' | python -c 'import json,sys; print(json.load(sys.stdin)["record_id"])')
+     }' | jget record_id)
+echo "R1=$R1"; echo "R2=$R2"
 
-# --- 3. CAS: la segunda escritura con la misma versión PIERDE --------------
-curl -s -X PUT "$VM/vault/collections/$C/records/$R1" -H "$A" \
-  -H 'Content-Type: application/json' \
-  -d '{"expected_version":1,"values":{"usuario":"demo-uno","password":"v2-ficticio"}}' \
+# Dos claves distintas en Vault, no una sobrescrita dos veces
+docker compose exec vault-service vault kv list "secret/vpg-managed/$C"
+```
+
+```bash
+# --- 4. CAS: la segunda escritura con la misma versión PIERDE --------------
+api PUT "$VM/vault/collections/$C/records/$R1" \
+  '{"expected_version":1,"values":{"usuario":"demo-uno","password":"v2-ficticio"}}' \
   | python -m json.tool          # 200, version 2
 
-curl -s -o /dev/null -w 'CAS caducado -> HTTP %{http_code}\n' \
-  -X PUT "$VM/vault/collections/$C/records/$R1" -H "$A" \
-  -H 'Content-Type: application/json' \
-  -d '{"expected_version":1,"values":{"usuario":"demo-uno","password":"no-se-escribe"}}'
-# CAS caducado -> HTTP 409
+api PUT "$VM/vault/collections/$C/records/$R1" \
+  '{"expected_version":1,"values":{"usuario":"demo-uno","password":"no-se-escribe"}}'
+# ERROR: PUT ... -> 409  con code=cas_conflict. El cambio ajeno sigue intacto.
+```
 
-# --- 4. PATCH: omitido conserva, null elimina ------------------------------
-curl -s -X PATCH "$VM/vault/collections/$C/records/$R1" -H "$A" \
-  -H 'Content-Type: application/json' \
-  -d '{"expected_version":2,"patch":{"password":"v3-ficticio","rfc":null}}' \
-  | python -m json.tool          # 200, version 3
+```bash
+# --- 5. PATCH: omitido conserva, null elimina ------------------------------
+api PUT "$VM/vault/collections/$C/records/$R1" \
+  '{"expected_version":2,"values":{"usuario":"demo-uno","password":"v3","rfc":"XAXX010101000"}}' \
+  >/dev/null
+api PATCH "$VM/vault/collections/$C/records/$R1" \
+  '{"expected_version":3,"patch":{"password":"v4-ficticio","rfc":null}}' \
+  | python -m json.tool          # 200, version 4
+
+# 'usuario' se omitió y se conserva; 'rfc' llevaba null y ya no está
+api POST "$VM/vault/collections/$C/records/$R1/read" \
+  '{"delivery":"plain","reason":"recorrido del README"}' \
+  | python -c 'import json,sys; print(sorted(json.load(sys.stdin)["delivery"]["values"]))'
+# ['password', 'usuario']
 
 # null sobre un campo OBLIGATORIO: 422 y NO se escribe nada
-curl -s -X PATCH "$VM/vault/collections/$C/records/$R1" -H "$A" \
-  -H 'Content-Type: application/json' \
-  -d '{"expected_version":3,"patch":{"password":null}}' | python -m json.tool
+api PATCH "$VM/vault/collections/$C/records/$R1" \
+  '{"expected_version":4,"patch":{"password":null}}'
+# ERROR: PATCH ... -> 422  con el campo y el motivo
+```
 
-# --- 5. entrega envuelta (por defecto) -------------------------------------
-W=$(curl -s -X POST "$VM/vault/collections/$C/records/$R1/read" -H "$A" \
-    -H 'Content-Type: application/json' -d '{}' \
-    | python -c 'import json,sys; print(json.load(sys.stdin)["delivery"]["wrap_token"])')
-echo "wrap token recibido: ${W:0:12}...  (un solo uso, TTL 60 s)"
-docker compose exec -T vault-service vault unwrap "$W" >/dev/null && echo "desenvuelto OK"
+```bash
+# --- 6. entrega envuelta (por defecto) -------------------------------------
+W=$(api POST "$VM/vault/collections/$C/records/$R1/read" '{}' | jget delivery.wrap_token)
+echo "wrap token de ${#W} caracteres (un solo uso, TTL 60 s)"
+docker compose exec -T vault-service vault unwrap -format=json "$W" \
+  | python -c 'import json,sys; d=json.load(sys.stdin)["data"]["data"]; print("esquema v%s, campos: %s" % (d["schema_version"], sorted(d["values"])))'
 docker compose exec -T vault-service vault unwrap "$W" 2>&1 | tail -1
 # el segundo intento falla: es de un solo uso
+unset W
+```
 
-# --- 6. renombrar: el historial NO se pierde -------------------------------
-curl -s -X PATCH "$VM/vault/collections/$C" -H "$A" -H 'Content-Type: application/json' \
-  -d '{"logical_name":"sat/datos-demo"}' | python -m json.tool
-curl -s "$VM/vault/collections/$C/records/$R1/metadata" -H "$A" | python -m json.tool
-# mismo collection_id, mismo physical_prefix, versiones 1..3 intactas
+```bash
+# --- 7. renombrar: el historial NO se pierde -------------------------------
+api PATCH "$VM/vault/collections/$C" '{"logical_name":"sat/datos-demo"}' \
+  | python -c 'import json,sys; d=json.load(sys.stdin); print(d["logical_name"], d["collection_id"], d["physical_prefix"])'
+api GET "$VM/vault/collections/$C/records/$R1/metadata" \
+  | python -c 'import json,sys; print([v["version"] for v in json.load(sys.stdin)["versions"]])'
+# mismo collection_id, mismo physical_prefix, versiones 1..4 intactas
+```
 
-# --- 7. esquema compatible (crea v2) e incompatible (409) -----------------
-curl -s -X PUT "$VM/vault/collections/$C/schema" -H "$A" -H 'Content-Type: application/json' -d '{
+```bash
+# --- 8. esquema compatible (crea v2) e incompatible (409) -----------------
+api PUT "$VM/vault/collections/$C/schema" '{
   "fields": [
     {"name":"usuario","type":"string","required":true,"max_length":64},
     {"name":"password","type":"string","required":true,"sensitive":true,"max_length":256},
@@ -657,45 +780,53 @@ curl -s -X PUT "$VM/vault/collections/$C/schema" -H "$A" -H 'Content-Type: appli
   ], "note": "se añade notas opcional"
 }' | python -m json.tool          # 200, applied=true, versión 2
 
-curl -s -X PUT "$VM/vault/collections/$C/schema" -H "$A" -H 'Content-Type: application/json' \
-  -d '{"fields":[{"name":"usuario","type":"string","required":true,"max_length":64}]}' \
-  | python -m json.tool          # 409 schema_incompatible, con el detalle por campo
+api PUT "$VM/vault/collections/$C/schema" \
+  '{"fields":[{"name":"usuario","type":"string","required":true,"max_length":64}]}'
+# ERROR: PUT ... -> 409  con code=schema_incompatible y el detalle por campo
+```
 
-# --- 8. capacidad efectiva -------------------------------------------------
-curl -s -X POST "$VM/vault/access-check" -H "$A" -H 'Content-Type: application/json' \
-  -d "{\"collection_id\":\"$C\",\"record_id\":\"$R1\",\"operations\":[\"record_read\",\"record_replace\",\"record_purge\"]}" \
-  | python -m json.tool
+```bash
+# --- 9. capacidad efectiva -------------------------------------------------
+api POST "$VM/vault/access-check" "$(python -c "
+import json,sys
+print(json.dumps({'collection_id':sys.argv[1],'record_id':sys.argv[2],
+                  'operations':['record_read','record_replace','record_purge']}))" \
+  "$C" "$R1")" | python -m json.tool
+```
 
-# --- 9. destructivo: hace falta step-up de MFA -----------------------------
-curl -s -o /dev/null -w 'purga sin prueba -> HTTP %{http_code}\n' \
-  -X POST "$VM/vault/collections/$C/records/$R2/purge" -H "$A" \
-  -H 'Content-Type: application/json' -d '{"confirm":"PURGE"}'
-# purga sin prueba -> HTTP 403  (mfa_proof_required)
+```bash
+# --- 10. destructivo: hace falta step-up de MFA ----------------------------
+api POST "$VM/vault/collections/$C/records/$R2/purge" '{"confirm":"PURGE"}'
+# ERROR: POST ... -> 403  con code=mfa_proof_required
 
-read -rsp "Contraseña de ada.admin (reautenticación): " PASS; echo
-SCH=$(curl -s -X POST "$UM/auth/mfa/step-up" -H "$A" -H 'Content-Type: application/json' \
-      -d "{\"password\":\"$PASS\",\"operation\":\"record_purge\",\"collection_id\":\"$C\",\"resource_ids\":[\"$R2\"]}" \
-      | python -c 'import json,sys; print(json.load(sys.stdin)["challenge_id"])')
+read -rsp "Contraseña de $ADMIN (reautenticación): " PASS; echo
+SCH=$(api POST "$UM/auth/mfa/step-up" "$(python -c "
+import json,sys
+print(json.dumps({'password':sys.argv[1],'operation':'record_purge',
+                  'collection_id':sys.argv[2],'resource_ids':[sys.argv[3]]}))" \
+      "$PASS" "$C" "$R2")" | jget challenge_id)
 unset PASS
-read -rp "Código TOTP NUEVO: " CODE2
-P=$(curl -s -X POST "$UM/auth/mfa/step-up/verify" -H "$A" -H 'Content-Type: application/json' \
-    -d "{\"challenge_id\":\"$SCH\",\"code\":\"$CODE2\"}" \
-    | python -c 'import json,sys; print(json.load(sys.stdin)["mfa_proof"])')
 
-curl -s -o /dev/null -w 'purga con prueba -> HTTP %{http_code}\n' \
-  -X POST "$VM/vault/collections/$C/records/$R2/purge" -H "$A" \
-  -H "X-VPG-MFA-Proof: $P" -H 'Content-Type: application/json' \
-  -d '{"confirm":"PURGE","reason":"limpieza de fixtures"}'
-# purga con prueba -> HTTP 204
+# Un código TOTP NUEVO: el anterior ya se usó y Vault no admite repetirlo
+read -rp "Código TOTP nuevo: " CODE2
+P=$(api POST "$UM/auth/mfa/step-up/verify" "$(python -c "
+import json,sys
+print(json.dumps({'challenge_id':sys.argv[1],'code':sys.argv[2]}))" \
+    "$SCH" "$CODE2")" | jget mfa_proof)
+unset CODE2
 
-# la prueba es de UN SOLO USO: repetirla falla
-curl -s -o /dev/null -w 'misma prueba otra vez -> HTTP %{http_code}\n' \
-  -X POST "$VM/vault/collections/$C/records/$R1/purge" -H "$A" \
-  -H "X-VPG-MFA-Proof: $P" -H 'Content-Type: application/json' -d '{"confirm":"PURGE"}'
-# misma prueba otra vez -> HTTP 403  (mfa_proof_invalid)
+api POST "$VM/vault/collections/$C/records/$R2/purge" \
+  '{"confirm":"PURGE","reason":"limpieza de fixtures"}' && echo "purgado (204)"
 
-# --- 10. auditoría: quién, qué y con qué resultado, sin valores -----------
-curl -s "$VM/vault/audit?collection_id=$C&limit=10" -H "$A" | python -m json.tool
+# La prueba es de UN SOLO USO: repetirla falla
+api POST "$VM/vault/collections/$C/records/$R1/purge" '{"confirm":"PURGE"}'
+# ERROR: POST ... -> 403  con code=mfa_proof_invalid
+unset P
+```
+
+```bash
+# --- 11. auditoría: quién, qué y con qué resultado, sin valores ------------
+api GET "$VM/vault/audit?collection_id=$C&limit=10" | python -m json.tool
 ```
 
 ### 7. Comprobar los datos **directamente en Vault**, sin imprimir valores
@@ -761,8 +892,8 @@ límite, no es un fallo.
 
 ```bash
 bash scripts/vault_mgmt/reconcile-operations.sh
-bash scripts/vault_mgmt/reconcile-operations.sh --operation <operation_id>
-bash scripts/vault_mgmt/reconcile-operations.sh --close <operation_id> \
+bash scripts/vault_mgmt/reconcile-operations.sh --operation '<operation_id>'
+bash scripts/vault_mgmt/reconcile-operations.sh --close '<operation_id>' \
      --as failed --note "revisado: Vault no escribió"
 ```
 
@@ -776,7 +907,7 @@ ya lo revisó. `--close` no toca Vault ni el índice de registros.
 Para contrastar el prefijo gestionado con el catálogo:
 
 ```bash
-export VAULT_TOKEN=<token administrativo>     # no se guarda en ningún archivo
+export VAULT_TOKEN='<token administrativo>'     # no se guarda en ningún archivo
 python scripts/vault_mgmt/inventory_import.py audit
 ```
 
@@ -786,7 +917,7 @@ Los secretos que ya existían, como `secret/sat/usuarios`, **se conservan**. La
 importación es explícita, no destructiva y con CAS:
 
 ```bash
-export VAULT_TOKEN=<token administrativo>
+export VAULT_TOKEN='<token administrativo>'
 
 # 1. qué hay, sin tocar nada
 python scripts/vault_mgmt/inventory_import.py list --path sat
@@ -813,14 +944,14 @@ valores en ningún modo.
 bash scripts/vault_mgmt/crawler-approle-bootstrap.sh
 
 # Asignarle registros (solo admin, con su api_session)
-curl -s -X PUT "$VM/vault/consumers/<consumer_id>/bindings" -H "$A" \
+curl -s -X PUT "$VM/vault/consumers/'<consumer_id>'/bindings" -H "$A" \
   -H 'Content-Type: application/json' \
   -d "{\"bindings\":[{\"collection_id\":\"$C\",\"record_id\":\"$R1\",\"pinned_version\":null}]}" \
   | python -m json.tool
 
 # Consumo con datos ficticios. No imprime valores: nombres y tamaños
 python scripts/vault_mgmt/crawler_client.py \
-  --role-id <role_id> --secret-id <secret_id> \
+  --role-id '<role_id>' --secret-id '<secret_id>' \
   --record "$C:$R1" --double-unwrap
 ```
 
@@ -836,7 +967,7 @@ un sitio externo: aquí no hay crawling.**
 # operation = collection_purge_batch
 curl -s -o /dev/null -w 'purga de colección -> HTTP %{http_code}\n' \
   -X POST "$VM/vault/collections/$C/purge" -H "$A" \
-  -H "X-VPG-MFA-Proof: <prueba nueva>" -H 'Content-Type: application/json' \
+  -H "X-VPG-MFA-Proof: '<prueba nueva>'" -H 'Content-Type: application/json' \
   -d '{"confirm":"PURGE","reason":"limpieza de fixtures de demostración"}'
 
 # Revocar el consumidor de prueba
