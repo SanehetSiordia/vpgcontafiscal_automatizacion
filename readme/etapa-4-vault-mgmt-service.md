@@ -832,25 +832,89 @@ api GET "$VM/vault/audit?collection_id=$C&limit=10" | python -m json.tool
 ### 7. Comprobar los datos **directamente en Vault**, sin imprimir valores
 
 Lo importante es ver la estructura, las versiones y los estados, no el
-contenido. Estos comandos no imprimen ningún valor:
+contenido.
+
+> **Antes necesitas tres variables: `C`, `R1` y `PREFIJO`.** Un script no puede
+> dejar variables en el shell que lo invoca, así que si llegaste aquí con
+> `walkthrough.sh` **no las tienes**, y los comandos de abajo construirían una
+> ruta como `secret/vpg-managed//`, que responde `No value found at
+> secret/metadata/vpg-managed`: no es que falten los datos, es que falta el
+> UUID. Tienes dos formas de obtenerlas.
+
+**Si usaste `walkthrough.sh --keep`**, las imprime al terminar, listas para
+copiar. Sin `--keep` purga la colección al final, así que no queda nada que
+inspeccionar: usa `--keep` cuando quieras hacer esta comprobación.
+
+**O resuélvelas desde el catálogo**, que funciona siempre y sin sesión:
 
 ```bash
-# Las claves del prefijo gestionado: un hijo por colección, y uno por registro
-docker compose exec vault-service vault kv list secret/vpg-managed
-docker compose exec vault-service vault kv list "secret/vpg-managed/$C"
+# La colección activa más reciente y su primer registro vivo.
+# Ajusta el filtro si quieres otra: logical_name LIKE 'sat/%'.
+eval "$(docker compose exec -T postgres-service psql --no-psqlrc -qtAX \
+  -U vpg_admin -d vpg_contadores -c "
+SELECT 'C=' || c.collection_id || ' PREFIJO=' || c.kv_prefix || '/' || c.collection_id
+       || ' R1=' || coalesce(r.record_id::text, '')
+  FROM vault_mgmt.secret_collections c
+  LEFT JOIN LATERAL (
+       SELECT record_id FROM vault_mgmt.secret_records
+        WHERE collection_id = c.collection_id AND state = 'active'
+        ORDER BY created_at LIMIT 1) r ON true
+ WHERE c.state = 'active'
+ ORDER BY c.created_at DESC LIMIT 1;" | tr -d '\r')"
+
+echo "C=$C"; echo "R1=$R1"; echo "PREFIJO=$PREFIJO"
+: "${C:?no hay ninguna colección activa: lanza walkthrough.sh --keep}"
+: "${R1:?la colección no tiene registros vivos: lanza walkthrough.sh --keep}"
+```
+
+Con eso, estos comandos no imprimen ningún valor:
+
+```bash
+# Las claves del prefijo gestionado: un hijo por colección, y uno por registro.
+#
+# "No value found" aquí NO es un error: KV v2 no tiene carpetas, así que un
+# prefijo sin claves no existe. Es lo correcto si todavía no hay registros.
+# Como `vault kv list` sale con código distinto de cero en ese caso, Docker
+# añade un "Debug this Compose error with Gordon": es ruido suyo, no un fallo
+# de Compose ni del servicio.
+docker compose exec vault-service vault kv list "secret/$PREFIJO"
 
 # Metadata nativa: versiones, estados e irreversibilidades. NO imprime datos
-docker compose exec vault-service vault kv metadata get "secret/vpg-managed/$C/$R1"
+docker compose exec vault-service vault kv metadata get "secret/$PREFIJO/$R1"
 
-# Solo los NOMBRES de los campos de la versión actual, nunca sus valores
-docker compose exec vault-service sh -c \
-  "vault kv get -format=json secret/vpg-managed/$C/$R1" \
-  | python -c 'import json,sys; d=json.load(sys.stdin)["data"]["data"]; \
-print("schema_version:", d["schema_version"]); print("campos:", sorted(d["values"]))'
+# Solo los NOMBRES de los campos de la versión actual, nunca sus valores.
+# Comprueba además que la clave la escribió el servicio: éste guarda la
+# envoltura {"schema_version": N, "values": {...}} con `values` como OBJETO.
+# Una clave escrita a mano con `vault kv put values='{...}'` deja `values`
+# como cadena, y entonces esto lo dice en vez de imprimir sus caracteres.
+docker compose exec -T vault-service \
+  vault kv get -format=json "secret/$PREFIJO/$R1" \
+  | python -c 'import json,sys
+d = json.load(sys.stdin)["data"]["data"]
+print("schema_version:", d.get("schema_version"))
+valores = d.get("values")
+if isinstance(valores, dict):
+    print("campos:", sorted(valores))
+else:
+    print("AVISO: values es", type(valores).__name__,
+          "- esta clave no la escribio el servicio")'
+```
 
-# Confirmar que un registro purgado ya no existe en Vault
-docker compose exec vault-service vault kv metadata get "secret/vpg-managed/$C/$R2" \
-  2>&1 | tail -1          # "No value found"
+Para confirmar que un registro purgado ya no existe en Vault, usa su UUID: el
+catálogo lo conserva con estado `destroyed`, que es justo lo que distingue
+«destruido» de «nunca existió».
+
+```bash
+R_PURGADO=$(docker compose exec -T postgres-service psql --no-psqlrc -qtAX \
+  -U vpg_admin -d vpg_contadores -c "
+SELECT record_id FROM vault_mgmt.secret_records
+ WHERE collection_id = '$C' AND state = 'destroyed' LIMIT 1;" | tr -d '\r[:space:]')
+
+if [[ -n "$R_PURGADO" ]]; then
+  docker compose exec vault-service \
+    vault kv metadata get "secret/$PREFIJO/$R_PURGADO" 2>&1 | tail -1
+  # "No value found": en Vault no queda nada, y en el catálogo sigue como destroyed
+fi
 ```
 
 Y que PostgreSQL **no** guarda ningún valor, recorriendo toda columna de texto y

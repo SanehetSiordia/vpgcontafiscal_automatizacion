@@ -18,7 +18,7 @@
 #   8. Renombrado que conserva UUID, path fisico e historial.
 #   9. Esquema compatible (crea version) e incompatible (409, sin crear nada).
 #  10. Capacidad efectiva: rol de aplicacion Y ACL de Vault.
-#  11. Metadata nativa con los tres estados: activa, borrada y destruida.
+#  11. Los tres estados de una version.
 #  12. Purga con reautenticacion MFA, y la misma prueba rechazada al reusarla.
 #  13. Auditoria sin valores, y limpieza de los fixtures.
 #
@@ -34,6 +34,10 @@
 #
 # Ningun valor de secreto, token de sesion o wrapping token se imprime: de las
 # entregas se muestran los NOMBRES de los campos y el tamano del token.
+#
+# Al terminar imprime los UUID de la coleccion y de los registros, listos para
+# exportar, porque las comprobaciones manuales del README (seccion 7) los
+# necesitan y un script no puede dejar variables en el shell que lo invoca.
 set -Eeuo pipefail
 
 trap 'rc=$?; printf "\nERROR INTERNO: linea %s, codigo %s.\n  Orden: %s\n" \
@@ -43,7 +47,7 @@ KEEP=false
 for arg in "$@"; do
   case "$arg" in
     --keep) KEEP=true ;;
-    -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,41p' "$0"; exit 0 ;;
     *) echo "ERROR: argumento desconocido: $arg" >&2; exit 1 ;;
   esac
 done
@@ -93,9 +97,16 @@ for k in sys.argv[1].split('.'):
         d.get(k) if isinstance(d, dict) else None)
 print(d if d is not None else '')" "$1"; }
 
-# api <METODO> <URL> [CUERPO] -> cuerpo en stdout y estado en la variable ESTADO.
-# Nunca aborta: cada paso decide si el estado que recibio es el que esperaba,
-# porque varios pasos de este recorrido esperan 409 o 422 a proposito.
+# api <METODO> <URL> [CUERPO]
+#
+# Fija dos variables GLOBALES: ESTADO con el codigo HTTP y RESP con el cuerpo.
+#
+# Se llama SIN sustitucion de comandos, y eso no es un detalle de estilo:
+# `RESP=$(api ...)` ejecutaria api en un subshell y el ESTADO que fijara dentro
+# NO llegaria aqui, asi que las comprobaciones leerian el estado de la llamada
+# anterior. Esa fue exactamente la causa de que este recorrido fallara con
+# "se esperaba 201, se recibio 200" cuando la coleccion si se habia creado.
+RESP=""
 ESTADO=""
 api() {
   local metodo=$1 url=$2 cuerpo=${3-}
@@ -107,23 +118,29 @@ api() {
   local respuesta
   respuesta=$(curl -w $'\n%{http_code}' "${opciones[@]}" 2>&1) || true
   ESTADO=${respuesta##*$'\n'}
-  printf '%s' "${respuesta%$'\n'*}"
+  RESP=${respuesta%$'\n'*}
+  # Un fallo de transporte deja el estado en 000 y el motivo en el cuerpo.
+  [[ "$ESTADO" =~ ^[0-9]{3}$ ]] || { RESP=$respuesta; ESTADO="000"; }
 }
 
-# exigir <esperado> <cuerpo> <descripcion>: si el estado no es el esperado,
-# imprime el cuerpo real y para. Es la diferencia entre "no funciona" y saber
-# por que.
+# exigir <esperado> <descripcion>: si el estado de la ULTIMA llamada no es el
+# esperado, imprime el cuerpo real y para. Es la diferencia entre "no funciona"
+# y saber por que.
 exigir() {
-  local esperado=$1 cuerpo=$2 descripcion=$3
+  local esperado=$1 descripcion=$2
   if [[ "$ESTADO" != "$esperado" ]]; then
     printf 'FALLO\n'
     printf '\n  Se esperaba HTTP %s en: %s\n' "$esperado" "$descripcion"
     printf '  Se recibio HTTP %s con este cuerpo:\n\n' "${ESTADO:-sin respuesta}"
-    printf '%s\n\n' "$cuerpo" | python -m json.tool 2>/dev/null \
-      || printf '%s\n\n' "$cuerpo"
+    printf '%s\n' "$RESP" | python -m json.tool 2>/dev/null \
+      || printf '%s\n' "$RESP"
+    printf '\n'
     exit 1
   fi
 }
+
+# campo "a.b" -> extrae del cuerpo de la ultima respuesta.
+campo() { printf '%s' "$RESP" | jget "$1"; }
 
 # Lee un codigo TOTP con eco enmascarado. Nunca queda en el historial.
 leer_totp() {
@@ -151,7 +168,7 @@ leer_totp() {
 
 json() { python -c "
 import json,sys
-print(json.dumps(json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}))" "$1"; }
+print(json.dumps(json.loads(sys.argv[1])))" "$1"; }
 
 # =============================================================================
 titulo "1. Salud de las dos APIs"
@@ -162,13 +179,12 @@ for par in "user-mgmt:${UM_BASE}" "vault-mgmt:${VM_BASE}"; do
   ok "$(curl -s -o /dev/null -w '%{http_code}' "${base}/health/live")"
 
   paso "${nombre} /health/ready"
-  cuerpo=$(curl -s -w $'\n%{http_code}' "${base}/health/ready" 2>&1) || true
-  estado=${cuerpo##*$'\n'}; cuerpo=${cuerpo%$'\n'*}
-  ok "$estado" "ready=$(printf '%s' "$cuerpo" | jget ready)"
-  if [[ "$estado" != "200" ]]; then
+  api GET "${base}/health/ready"
+  ok "$ESTADO" "ready=$(campo ready)"
+  if [[ "$ESTADO" != "200" ]]; then
     echo
     echo "  ${nombre} no esta listo. Detalle:"
-    printf '    %s\n' "$(printf '%s' "$cuerpo" | jget detail)"
+    nota "$(campo detail)"
     echo
     echo "  Si Vault esta sellado, desbloquealo (paso MANUAL) y repite:"
     echo "    docker compose exec vault-service vault operator unseal"
@@ -180,9 +196,9 @@ done
 titulo "2. Sesion en user-mgmt (el login no vive en vault-mgmt)"
 # =============================================================================
 paso "GET ${VM_PREFIX}/vault/collections sin sesion"
-api GET "${VM}/vault/collections" >/dev/null
+api GET "${VM}/vault/collections"
 ok "$ESTADO" "<- 401 esperado"
-[[ "$ESTADO" == "401" ]] || { echo "FALLO: se esperaba 401 sin sesion"; exit 1; }
+exigir 401 "peticion de negocio sin sesion"
 
 [[ -n "$ADMIN_USER" ]] || {
   echo "ERROR: falta VAULT_ADMIN_USER_NAME en .env" >&2; exit 1; }
@@ -191,41 +207,41 @@ PASS=$(env_get VAULT_ADMIN_USER_PASS)
   echo "ERROR: falta VAULT_ADMIN_USER_PASS en .env" >&2; exit 1; }
 
 paso "POST ${UM_PREFIX}/auth/login (solo contrasena)"
-LOGIN=$(python -c "
+# La contrasena se construye en Python y viaja por --data-binary: no aparece en
+# la linea de ordenes ni en el historial.
+CUERPO=$(python -c "
 import json,sys
 print(json.dumps({'username': sys.argv[1], 'password': sys.argv[2]}))" \
-  "$ADMIN_USER" "$PASS" \
-  | curl -sS -w $'\n%{http_code}' -X POST -H 'Content-Type: application/json' \
-         --data-binary @- "${UM}/auth/login" 2>&1) || true
+  "$ADMIN_USER" "$PASS")
 PASS=''; unset PASS
-ESTADO=${LOGIN##*$'\n'}; LOGIN=${LOGIN%$'\n'*}
-exigir 200 "$LOGIN" "login con la contrasena de ${ADMIN_USER}"
-CHALLENGE=$(printf '%s' "$LOGIN" | jget challenge_id)
+api POST "${UM}/auth/login" "$CUERPO"
+CUERPO=''; unset CUERPO
+exigir 200 "login con la contrasena de ${ADMIN_USER}"
+CHALLENGE=$(campo challenge_id)
 ok 200 "desafio recibido, SIN sesion"
-nota "contiene api_session: $(printf '%s' "$LOGIN" \
+nota "contiene api_session: $(printf '%s' "$RESP" \
   | python -c 'import json,sys;print("api_session" in json.load(sys.stdin))')"
 
 leer_totp "para iniciar sesion"
 paso "POST ${UM_PREFIX}/auth/mfa/verify"
-VERIFY=$(python -c "
+api POST "${UM}/auth/mfa/verify" "$(python -c "
 import json,sys
 print(json.dumps({'challenge_id': sys.argv[1], 'code': sys.argv[2]}))" \
-  "$CHALLENGE" "$CODIGO" \
-  | curl -sS -w $'\n%{http_code}' -X POST -H 'Content-Type: application/json' \
-         --data-binary @- "${UM}/auth/mfa/verify" 2>&1) || true
+  "$CHALLENGE" "$CODIGO")"
 CODIGO=''; unset CODIGO
-ESTADO=${VERIFY##*$'\n'}; VERIFY=${VERIFY%$'\n'*}
-exigir 200 "$VERIFY" "validacion del codigo TOTP"
-SESION=$(printf '%s' "$VERIFY" | jget api_session)
+exigir 200 "validacion del codigo TOTP"
+SESION=$(campo api_session)
+USUARIO=$(campo username)
+ROLES=$(campo role_codes)
 A="Authorization: Bearer ${SESION}"
 ok 200 "sesion establecida"
-nota "usuario=$(printf '%s' "$VERIFY" | jget username)  roles=$(printf '%s' "$VERIFY" | jget role_codes)"
+nota "usuario=${USUARIO}  roles=${ROLES}"
 
 # =============================================================================
 titulo "3. Coleccion con esquema tipado (no crea nada en Vault)"
 # =============================================================================
 paso "POST ${VM_PREFIX}/vault/collections"
-CUERPO=$(python -c "
+api POST "${VM}/vault/collections" "$(python -c "
 import json,sys
 print(json.dumps({
   'logical_name': sys.argv[1],
@@ -237,13 +253,12 @@ print(json.dumps({
      'sensitive': True, 'max_length': 256},
     {'name': 'rfc',      'type': 'string', 'required': False, 'max_length': 13},
   ],
-}))" "$COLECCION")
-RESP=$(api POST "${VM}/vault/collections" "$CUERPO")
-exigir 201 "$RESP" "creacion de la coleccion ${COLECCION}"
-C=$(printf '%s' "$RESP" | jget collection_id)
-PREFIJO=$(printf '%s' "$RESP" | jget physical_prefix)
+}))" "$COLECCION")"
+exigir 201 "creacion de la coleccion ${COLECCION}"
+C=$(campo collection_id)
+PREFIJO=$(campo physical_prefix)
 ok 201 "collection_id=${C}"
-nota "nombre logico : $(printf '%s' "$RESP" | jget logical_name)"
+nota "nombre logico : $(campo logical_name)"
 nota "path fisico   : ${PREFIJO}"
 nota "el path sale del UUID, no del nombre: renombrar no movera nada"
 
@@ -262,41 +277,39 @@ fi
 titulo "4. Dos registros INDEPENDIENTES: dos secretos, no uno sobrescrito"
 # =============================================================================
 crear_registro() {
-  local etiqueta=$1 usuario=$2 clave=$3
-  local cuerpo
-  cuerpo=$(python -c "
+  api POST "${VM}/vault/collections/${C}/records" "$(python -c "
 import json,sys
 print(json.dumps({'label': sys.argv[1],
                   'values': {'usuario': sys.argv[2], 'password': sys.argv[3]}}))" \
-    "$etiqueta" "$usuario" "$clave")
-  api POST "${VM}/vault/collections/${C}/records" "$cuerpo"
+    "$1" "$2" "$3")"
 }
 
 paso "POST .../records (primero)"
-RESP=$(crear_registro "contribuyente-uno-${SUFIJO}" "demo-uno" "valor-ficticio-1")
-exigir 201 "$RESP" "creacion del primer registro"
-R1=$(printf '%s' "$RESP" | jget record_id)
-V1=$(printf '%s' "$RESP" | jget version)
-ok 201 "record_id=${R1}  version=${V1}"
+crear_registro "contribuyente-uno-${SUFIJO}" "demo-uno" "valor-ficticio-1"
+exigir 201 "creacion del primer registro"
+R1=$(campo record_id)
+ok 201 "record_id=${R1}  version=$(campo version)"
 
 paso "POST .../records (segundo)"
-RESP=$(crear_registro "contribuyente-dos-${SUFIJO}" "demo-dos" "valor-ficticio-2")
-exigir 201 "$RESP" "creacion del segundo registro"
-R2=$(printf '%s' "$RESP" | jget record_id)
-ok 201 "record_id=${R2}  version=$(printf '%s' "$RESP" | jget version)"
+crear_registro "contribuyente-dos-${SUFIJO}" "demo-dos" "valor-ficticio-2"
+exigir 201 "creacion del segundo registro"
+R2=$(campo record_id)
+ok 201 "record_id=${R2}  version=$(campo version)"
 
 paso "LIST ${KV_MOUNT}/${PREFIJO} en Vault"
-CLAVES=$(docker compose exec -T vault-service \
-  vault kv list -format=json "${KV_MOUNT}/${PREFIJO}" 2>/dev/null || echo '[]')
-CUANTAS=$(printf '%s' "$CLAVES" | python -c 'import json,sys;print(len(json.load(sys.stdin)))')
+CUANTAS=$(docker compose exec -T vault-service \
+  vault kv list -format=json "${KV_MOUNT}/${PREFIJO}" 2>/dev/null \
+  | python -c 'import json,sys
+try: print(len(json.load(sys.stdin)))
+except Exception: print(0)')
 ok "--" "${CUANTAS} claves distintas"
 [[ "$CUANTAS" == "2" ]] || { echo "FALLO: se esperaban 2 claves en Vault"; exit 1; }
 nota "dos registros = dos secretos, cada uno con su propio historial"
 
 paso "GET .../records (listado del catalogo)"
-RESP=$(api GET "${VM}/vault/collections/${C}/records")
-exigir 200 "$RESP" "listado de registros"
-ok 200 "total=$(printf '%s' "$RESP" | jget page.total)"
+api GET "${VM}/vault/collections/${C}/records"
+exigir 200 "listado de registros"
+ok 200 "total=$(campo page.total)"
 if printf '%s' "$RESP" | grep -q "valor-ficticio"; then
   echo "FALLO: el listado del catalogo contiene valores"; exit 1
 fi
@@ -305,43 +318,41 @@ nota "el listado NO contiene ningun valor"
 # =============================================================================
 titulo "5. CAS: la escritura con una version caducada no sobrescribe"
 # =============================================================================
-paso "PUT .../records/{id} con expected_version=${V1}"
-CUERPO=$(json '{"expected_version": 1, "values": {"usuario": "demo-uno", "password": "v2-ficticio"}}')
-RESP=$(api PUT "${VM}/vault/collections/${C}/records/${R1}" "$CUERPO")
-exigir 200 "$RESP" "reemplazo con el CAS correcto"
-V2=$(printf '%s' "$RESP" | jget version)
-ok 200 "version=${V2}"
+CAS_V1='{"expected_version": 1, "values": {"usuario": "demo-uno", "password": "v2-ficticio"}}'
+
+paso "PUT .../records/{id} con expected_version=1"
+api PUT "${VM}/vault/collections/${C}/records/${R1}" "$(json "$CAS_V1")"
+exigir 200 "reemplazo con el CAS correcto"
+ok 200 "version=$(campo version)"
 
 paso "PUT .../records/{id} con expected_version=1 otra vez"
-RESP=$(api PUT "${VM}/vault/collections/${C}/records/${R1}" "$CUERPO")
-exigir 409 "$RESP" "conflicto de CAS"
-ok 409 "code=$(printf '%s' "$RESP" | jget code)"
+api PUT "${VM}/vault/collections/${C}/records/${R1}" "$(json "$CAS_V1")"
+exigir 409 "conflicto de CAS"
+ok 409 "code=$(campo code)"
 nota "el cambio ajeno NO se sobrescribio"
 
 # =============================================================================
 titulo "6. PATCH: omitido conserva, null elimina"
 # =============================================================================
 paso "PUT .../records/{id} anadiendo rfc"
-CUERPO=$(json '{"expected_version": 2, "values": {"usuario": "demo-uno", "password": "v3-ficticio", "rfc": "XAXX010101000"}}')
-RESP=$(api PUT "${VM}/vault/collections/${C}/records/${R1}" "$CUERPO")
-exigir 200 "$RESP" "escritura con los tres campos"
-V3=$(printf '%s' "$RESP" | jget version)
+api PUT "${VM}/vault/collections/${C}/records/${R1}" "$(json '{"expected_version": 2, "values": {"usuario": "demo-uno", "password": "v3-ficticio", "rfc": "XAXX010101000"}}')"
+exigir 200 "escritura con los tres campos"
+V3=$(campo version)
 ok 200 "version=${V3}"
 
 paso "PATCH .../records/{id} con rfc=null"
-CUERPO=$(python -c "
+api PATCH "${VM}/vault/collections/${C}/records/${R1}" "$(python -c "
 import json,sys
 print(json.dumps({'expected_version': int(sys.argv[1]),
-                  'patch': {'password': 'v4-ficticio', 'rfc': None}}))" "$V3")
-RESP=$(api PATCH "${VM}/vault/collections/${C}/records/${R1}" "$CUERPO")
-exigir 200 "$RESP" "merge patch"
-V4=$(printf '%s' "$RESP" | jget version)
+                  'patch': {'password': 'v4-ficticio', 'rfc': None}}))" "$V3")"
+exigir 200 "merge patch"
+V4=$(campo version)
 ok 200 "version=${V4}"
 
 paso "POST .../read (plain) para ver los campos resultantes"
-RESP=$(api POST "${VM}/vault/collections/${C}/records/${R1}/read" \
-  "$(json '{"delivery": "plain", "reason": "recorrido del README"}')")
-exigir 200 "$RESP" "entrega plana"
+api POST "${VM}/vault/collections/${C}/records/${R1}/read" \
+  "$(json '{"delivery": "plain", "reason": "recorrido del README"}')"
+exigir 200 "entrega plana"
 CAMPOS=$(printf '%s' "$RESP" | python -c '
 import json,sys
 print(",".join(sorted(json.load(sys.stdin)["delivery"]["values"])))')
@@ -351,74 +362,73 @@ nota "usuario se omitio en el patch y se conserva; rfc llevaba null y ya no esta
   echo "FALLO: se esperaban exactamente password,usuario"; exit 1; }
 
 paso "PATCH .../records/{id} con password=null (obligatorio)"
-CUERPO=$(python -c "
+api PATCH "${VM}/vault/collections/${C}/records/${R1}" "$(python -c "
 import json,sys
-print(json.dumps({'expected_version': int(sys.argv[1]), 'patch': {'password': None}}))" "$V4")
-RESP=$(api PATCH "${VM}/vault/collections/${C}/records/${R1}" "$CUERPO")
-exigir 422 "$RESP" "patch que dejaria la tupla invalida"
-ok 422 "campo=$(printf '%s' "$RESP" | jget context.fields.0.field)"
+print(json.dumps({'expected_version': int(sys.argv[1]), 'patch': {'password': None}}))" "$V4")"
+exigir 422 "patch que dejaria la tupla invalida"
+ok 422 "campo=$(campo context.fields.0.field)"
 nota "422 y NO se escribio nada"
 
 # =============================================================================
 titulo "7. Entrega: envuelta por defecto, de un solo uso"
 # =============================================================================
 paso "POST .../read (sin delivery: envuelta)"
-RESP=$(api POST "${VM}/vault/collections/${C}/records/${R1}/read" "$(json '{}')")
-exigir 200 "$RESP" "entrega envuelta"
-WRAP=$(printf '%s' "$RESP" | jget delivery.wrap_token)
-ok 200 "modo=$(printf '%s' "$RESP" | jget delivery.mode)  ttl=$(printf '%s' "$RESP" | jget delivery.ttl_seconds)s"
+api POST "${VM}/vault/collections/${C}/records/${R1}/read" "$(json '{}')"
+exigir 200 "entrega envuelta"
+WRAP=$(campo delivery.wrap_token)
+ok 200 "modo=$(campo delivery.mode)  ttl=$(campo delivery.ttl_seconds)s"
 nota "token de ${#WRAP} caracteres; no se imprime ni se guarda"
-if printf '%s' "$RESP" | grep -q "valor-ficticio\|v4-ficticio"; then
+if printf '%s' "$RESP" | grep -qE "valor-ficticio|v4-ficticio"; then
   echo "FALLO: la entrega envuelta contiene valores"; exit 1
 fi
 
 paso "vault unwrap (primera vez)"
-UNWRAP=$(docker compose exec -T vault-service \
-  sh -c "VAULT_TOKEN='' vault unwrap -format=json '${WRAP}'" 2>&1 || true)
-CAMPOS=$(printf '%s' "$UNWRAP" | python -c '
+CAMPOS=$(docker compose exec -T -e VAULT_TOKEN= vault-service \
+  vault unwrap -format=json "$WRAP" 2>/dev/null \
+  | python -c '
 import json,sys
 try:
     d = json.load(sys.stdin)["data"]["data"]
-    print(",".join(sorted(d["values"])), "schema_version=" + str(d["schema_version"]))
+    print(",".join(sorted(d["values"])) + "  esquema=v" + str(d["schema_version"]))
 except Exception:
-    print("")' 2>/dev/null || echo "")
+    print("")' || true)
 if [[ -n "$CAMPOS" ]]; then
   ok "--" "campos=${CAMPOS}"
   nota "solo los NOMBRES: ningun valor se imprime"
 else
-  ok "--" "no se pudo desenvolver"
-  printf '%s\n' "$UNWRAP" | tail -2 | sed 's/^/      /'
+  ok "--" "no se pudo desenvolver (revisalo a mano)"
 fi
 
 paso "vault unwrap (segunda vez)"
-UNWRAP2=$(docker compose exec -T vault-service \
-  sh -c "VAULT_TOKEN='' vault unwrap '${WRAP}'" 2>&1 || true)
-if printf '%s' "$UNWRAP2" | grep -qiE "wrapping token is not valid|does not exist|invalid"; then
+SEGUNDO=$(docker compose exec -T -e VAULT_TOKEN= vault-service \
+  vault unwrap "$WRAP" 2>&1 || true)
+if printf '%s' "$SEGUNDO" | grep -qiE "wrapping token is not valid|does not exist|invalid|expired"; then
   ok "--" "rechazado: es de UN SOLO USO"
 else
   ok "--" "ATENCION: se pudo desenvolver dos veces"
-  printf '%s\n' "$UNWRAP2" | tail -2 | sed 's/^/      /'
+  printf '%s\n' "$SEGUNDO" | tail -2 | sed 's/^/      /'
 fi
 WRAP=''; unset WRAP
 
 # =============================================================================
 titulo "8. Renombrar conserva UUID, path fisico e historial"
 # =============================================================================
-paso "PATCH .../collections/{id} con otro nombre logico"
 NUEVO="sat/datos-${SUFIJO}"
-RESP=$(api PATCH "${VM}/vault/collections/${C}" \
-  "$(python -c "import json,sys;print(json.dumps({'logical_name': sys.argv[1]}))" "$NUEVO")")
-exigir 200 "$RESP" "renombrado de la coleccion"
-ok 200 "nombre=$(printf '%s' "$RESP" | jget logical_name)"
-[[ "$(printf '%s' "$RESP" | jget collection_id)" == "$C" ]] || {
+paso "PATCH .../collections/{id} con otro nombre logico"
+api PATCH "${VM}/vault/collections/${C}" "$(python -c "
+import json,sys
+print(json.dumps({'logical_name': sys.argv[1]}))" "$NUEVO")"
+exigir 200 "renombrado de la coleccion"
+ok 200 "nombre=$(campo logical_name)"
+[[ "$(campo collection_id)" == "$C" ]] || {
   echo "FALLO: el collection_id cambio"; exit 1; }
-[[ "$(printf '%s' "$RESP" | jget physical_prefix)" == "$PREFIJO" ]] || {
+[[ "$(campo physical_prefix)" == "$PREFIJO" ]] || {
   echo "FALLO: el path fisico cambio"; exit 1; }
 nota "mismo collection_id y mismo path fisico"
 
 paso "GET .../records/{id}/metadata (historial)"
-RESP=$(api GET "${VM}/vault/collections/${C}/records/${R1}/metadata")
-exigir 200 "$RESP" "metadata del registro"
+api GET "${VM}/vault/collections/${C}/records/${R1}/metadata"
+exigir 200 "metadata del registro"
 VERSIONES=$(printf '%s' "$RESP" | python -c '
 import json,sys
 print(",".join(str(v["version"]) for v in json.load(sys.stdin)["versions"]))')
@@ -429,7 +439,7 @@ nota "el historial sobrevive al renombrado"
 titulo "9. Esquema: compatible crea version, incompatible responde 409"
 # =============================================================================
 paso "PUT .../schema anadiendo un campo opcional"
-RESP=$(api PUT "${VM}/vault/collections/${C}/schema" "$(json '{
+api PUT "${VM}/vault/collections/${C}/schema" "$(json '{
   "fields": [
     {"name": "usuario",  "type": "string", "required": true,  "max_length": 64},
     {"name": "password", "type": "string", "required": true, "sensitive": true, "max_length": 256},
@@ -437,18 +447,18 @@ RESP=$(api PUT "${VM}/vault/collections/${C}/schema" "$(json '{
     {"name": "notas",    "type": "string", "required": false, "max_length": 500}
   ],
   "note": "se anade notas opcional"
-}')")
-exigir 200 "$RESP" "nueva version de esquema compatible"
-ok 200 "version=$(printf '%s' "$RESP" | jget current_schema_version)  compatible=$(printf '%s' "$RESP" | jget compatibility.compatible)"
+}')"
+exigir 200 "nueva version de esquema compatible"
+ok 200 "version=$(campo current_schema_version)  compatible=$(campo compatibility.compatible)"
 
 paso "PUT .../schema quitando un campo"
-RESP=$(api PUT "${VM}/vault/collections/${C}/schema" "$(json '{
+api PUT "${VM}/vault/collections/${C}/schema" "$(json '{
   "fields": [{"name": "usuario", "type": "string", "required": true, "max_length": 64}]
-}')")
-exigir 409 "$RESP" "esquema incompatible"
-ok 409 "code=$(printf '%s' "$RESP" | jget code)"
-nota "motivo: $(printf '%s' "$RESP" | jget context.breaking_changes.0.reason)"
-nota "registros afectados: $(printf '%s' "$RESP" | jget context.records_affected)"
+}')"
+exigir 409 "esquema incompatible"
+ok 409 "code=$(campo code)"
+nota "motivo: $(campo context.breaking_changes.0.reason)"
+nota "registros afectados: $(campo context.records_affected)"
 if printf '%s' "$RESP" | grep -q "ficticio"; then
   echo "FALLO: el diagnostico contiene valores"; exit 1
 fi
@@ -458,85 +468,103 @@ nota "el diagnostico habla de campos, nunca de valores"
 titulo "10. Capacidad efectiva: rol de aplicacion Y ACL de Vault"
 # =============================================================================
 paso "POST ${VM_PREFIX}/vault/access-check"
-RESP=$(api POST "${VM}/vault/access-check" "$(python -c "
+api POST "${VM}/vault/access-check" "$(python -c "
 import json,sys
 print(json.dumps({'collection_id': sys.argv[1], 'record_id': sys.argv[2],
                   'operations': ['record_read','record_replace','record_purge']}))" \
-  "$C" "$R1")")
-exigir 200 "$RESP" "comprobacion de capacidad"
-ok 200 "roles=$(printf '%s' "$RESP" | jget your_roles)"
+  "$C" "$R1")"
+exigir 200 "comprobacion de capacidad"
+ok 200 "roles=$(campo your_roles)"
 printf '%s' "$RESP" | python -c '
 import json,sys
 d = json.load(sys.stdin)
 for o in d["operations"]:
-    print(f"      {o[\"operation\"]:18} rol={o[\"allowed_by_application_role\"]}"
-          + (f"  ({o[\"reason\"]})" if o.get("reason") else ""))
+    linea = "      {:18} rol={}".format(o["operation"], o["allowed_by_application_role"])
+    if o.get("reason"):
+        linea += "  ({})".format(o["reason"])
+    print(linea)
 for ruta, caps in d["vault_capabilities"].items():
-    print(f"      vault: {ruta} -> {caps}")'
+    print("      vault: {} -> {}".format(ruta, caps))'
 
 # =============================================================================
 titulo "11. Los tres estados de una version"
 # =============================================================================
 paso "POST .../versions/delete (soft-delete de la version 1)"
-RESP=$(api POST "${VM}/vault/collections/${C}/records/${R1}/versions/delete" \
-  "$(json '{"versions": [1]}')")
-exigir 204 "$RESP" "soft-delete de una version historica"
+api POST "${VM}/vault/collections/${C}/records/${R1}/versions/delete" \
+  "$(json '{"versions": [1]}')"
+exigir 204 "soft-delete de una version historica"
 ok 204 "reversible con undelete"
 
 paso "GET .../records/{id} (el registro sigue activo)"
-RESP=$(api GET "${VM}/vault/collections/${C}/records/${R1}")
-exigir 200 "$RESP" "resumen del registro"
-ok 200 "state=$(printf '%s' "$RESP" | jget state)"
+api GET "${VM}/vault/collections/${C}/records/${R1}"
+exigir 200 "resumen del registro"
+ok 200 "state=$(campo state)"
 nota "borrar una version historica NO deja el registro borrado"
+
+paso "GET .../records/{id}/metadata (estados por version)"
+api GET "${VM}/vault/collections/${C}/records/${R1}/metadata"
+exigir 200 "metadata con los estados"
+printf '%s' "$RESP" | python -c '
+import json,sys
+for v in json.load(sys.stdin)["versions"]:
+    print("      version {:<3} {}".format(v["version"], v["state"]))'
 
 # =============================================================================
 titulo "12. Purga: admin + confirmacion + MFA reciente"
 # =============================================================================
 paso "POST .../records/{id}/purge SIN prueba de MFA"
-RESP=$(api POST "${VM}/vault/collections/${C}/records/${R2}/purge" \
-  "$(json '{"confirm": "PURGE"}')")
-exigir 403 "$RESP" "purga sin prueba de MFA"
-ok 403 "code=$(printf '%s' "$RESP" | jget code)"
+api POST "${VM}/vault/collections/${C}/records/${R2}/purge" \
+  "$(json '{"confirm": "PURGE"}')"
+exigir 403 "purga sin prueba de MFA"
+ok 403 "code=$(campo code)"
+
+pedir_prueba() {
+  local operacion=$1 recurso=$2 motivo=$3
+  local pass cuerpo
+  pass=$(env_get VAULT_ADMIN_USER_PASS)
+  paso "POST ${UM_PREFIX}/auth/mfa/step-up"
+  cuerpo=$(python -c "
+import json,sys
+print(json.dumps({'password': sys.argv[1], 'operation': sys.argv[2],
+                  'collection_id': sys.argv[3], 'resource_ids': [sys.argv[4]]}))" \
+    "$pass" "$operacion" "$C" "$recurso")
+  pass=''; unset pass
+  api POST "${UM}/auth/mfa/step-up" "$cuerpo"
+  cuerpo=''; unset cuerpo
+  exigir 200 "paso 1 de la reautenticacion (${operacion})"
+  local desafio
+  desafio=$(campo challenge_id)
+  ok 200 "desafio recibido, SIN prueba todavia"
+
+  leer_totp "$motivo"
+  paso "POST ${UM_PREFIX}/auth/mfa/step-up/verify"
+  api POST "${UM}/auth/mfa/step-up/verify" "$(python -c "
+import json,sys
+print(json.dumps({'challenge_id': sys.argv[1], 'code': sys.argv[2]}))" \
+    "$desafio" "$CODIGO")"
+  CODIGO=''; unset CODIGO
+  exigir 200 "paso 2 de la reautenticacion (${operacion})"
+  P=$(campo mfa_proof)
+  ok 200 "prueba emitida (un solo uso)"
+  nota "operacion=$(campo operation)  recursos=1"
+}
 
 echo
 echo "  Para purgar hace falta reautenticarse. Necesitas un codigo TOTP NUEVO:"
 echo "  si el autenticador aun muestra el anterior, espera a que cambie."
-PASS=$(env_get VAULT_ADMIN_USER_PASS)
-paso "POST ${UM_PREFIX}/auth/mfa/step-up"
-CUERPO=$(python -c "
-import json,sys
-print(json.dumps({'password': sys.argv[1], 'operation': 'record_purge',
-                  'collection_id': sys.argv[2], 'resource_ids': [sys.argv[3]]}))" \
-  "$PASS" "$C" "$R2")
-PASS=''; unset PASS
-RESP=$(api POST "${UM}/auth/mfa/step-up" "$CUERPO")
-exigir 200 "$RESP" "paso 1 de la reautenticacion"
-SCH=$(printf '%s' "$RESP" | jget challenge_id)
-ok 200 "desafio recibido, SIN prueba todavia"
-
-leer_totp "para autorizar la purga"
-paso "POST ${UM_PREFIX}/auth/mfa/step-up/verify"
-RESP=$(api POST "${UM}/auth/mfa/step-up/verify" "$(python -c "
-import json,sys
-print(json.dumps({'challenge_id': sys.argv[1], 'code': sys.argv[2]}))" \
-  "$SCH" "$CODIGO")")
-CODIGO=''; unset CODIGO
-exigir 200 "$RESP" "paso 2 de la reautenticacion"
-P=$(printf '%s' "$RESP" | jget mfa_proof)
-ok 200 "prueba emitida (un solo uso)"
-nota "operacion=$(printf '%s' "$RESP" | jget operation)  recursos=1"
+pedir_prueba record_purge "$R2" "para autorizar la purga del registro"
 
 paso "POST .../records/{id}/purge CON la prueba"
-RESP=$(api POST "${VM}/vault/collections/${C}/records/${R2}/purge" \
-  "$(json '{"confirm": "PURGE", "reason": "recorrido del README"}')")
-exigir 204 "$RESP" "purga del segundo registro"
+api POST "${VM}/vault/collections/${C}/records/${R2}/purge" \
+  "$(json '{"confirm": "PURGE", "reason": "recorrido del README"}')"
+exigir 204 "purga del segundo registro"
 ok 204 "datos y metadata destruidos"
 
 paso "POST .../records/{id}/purge reusando la MISMA prueba"
-RESP=$(api POST "${VM}/vault/collections/${C}/records/${R1}/purge" \
-  "$(json '{"confirm": "PURGE"}')")
-exigir 403 "$RESP" "reutilizacion de la prueba"
-ok 403 "code=$(printf '%s' "$RESP" | jget code)"
+api POST "${VM}/vault/collections/${C}/records/${R1}/purge" \
+  "$(json '{"confirm": "PURGE"}')"
+exigir 403 "reutilizacion de la prueba"
+ok 403 "code=$(campo code)"
 nota "la prueba era de un solo uso y ya se consumio"
 P=''; unset P
 
@@ -550,22 +578,23 @@ else
 fi
 
 paso "GET .../records/{id} del registro purgado"
-RESP=$(api GET "${VM}/vault/collections/${C}/records/${R2}")
-exigir 200 "$RESP" "resumen del registro purgado"
-ok 200 "state=$(printf '%s' "$RESP" | jget state)"
+api GET "${VM}/vault/collections/${C}/records/${R2}"
+exigir 200 "resumen del registro purgado"
+ok 200 "state=$(campo state)"
 nota "en el catalogo queda como 'destroyed': distingue destruido de inexistente"
 
 # =============================================================================
 titulo "13. Auditoria y limpieza"
 # =============================================================================
 paso "GET ${VM_PREFIX}/vault/audit"
-RESP=$(api GET "${VM}/vault/audit?collection_id=${C}&limit=100")
-exigir 200 "$RESP" "historial de auditoria"
-ok 200 "lineas=$(printf '%s' "$RESP" | jget page.total)"
+api GET "${VM}/vault/audit?collection_id=${C}&limit=100"
+exigir 200 "historial de auditoria"
+ok 200 "lineas=$(campo page.total)"
 printf '%s' "$RESP" | python -c '
 import json,sys
 for i in json.load(sys.stdin)["items"][:8]:
-    print(f"      {i[\"occurred_at\"][11:19]}  {i[\"actor_kind\"]:7} {i[\"action\"]:26} {i[\"outcome\"]}")'
+    print("      {}  {:7} {:26} {}".format(
+        i["occurred_at"][11:19], i["actor_kind"], i["action"], i["outcome"]))'
 if printf '%s' "$RESP" | grep -q "ficticio"; then
   echo "FALLO: la auditoria contiene valores"; exit 1
 fi
@@ -573,53 +602,29 @@ nota "la auditoria no contiene ningun valor ni wrapping token"
 
 if [[ "$KEEP" == true ]]; then
   echo
-  echo "  --keep: la coleccion ${NUEVO} se conserva."
-  echo "  Para purgarla luego hacen falta un step-up con"
-  echo "  operation=collection_purge_batch y resource_ids=[${R1}]."
+  echo "  --keep: la coleccion se conserva."
 else
   echo
   echo "  Limpieza de fixtures: se purgara la coleccion de prueba."
   echo "  Necesitas un TERCER codigo TOTP, nuevo."
-  PASS=$(env_get VAULT_ADMIN_USER_PASS)
-  paso "POST ${UM_PREFIX}/auth/mfa/step-up (purga de coleccion)"
-  CUERPO=$(python -c "
-import json,sys
-print(json.dumps({'password': sys.argv[1], 'operation': 'collection_purge_batch',
-                  'collection_id': sys.argv[2], 'resource_ids': [sys.argv[3]]}))" \
-    "$PASS" "$C" "$R1")
-  PASS=''; unset PASS
-  RESP=$(api POST "${UM}/auth/mfa/step-up" "$CUERPO")
-  exigir 200 "$RESP" "paso 1 de la reautenticacion de limpieza"
-  SCH=$(printf '%s' "$RESP" | jget challenge_id)
-  ok 200 "desafio recibido"
-
-  leer_totp "para purgar la coleccion"
-  paso "POST ${UM_PREFIX}/auth/mfa/step-up/verify"
-  RESP=$(api POST "${UM}/auth/mfa/step-up/verify" "$(python -c "
-import json,sys
-print(json.dumps({'challenge_id': sys.argv[1], 'code': sys.argv[2]}))" \
-    "$SCH" "$CODIGO")")
-  CODIGO=''; unset CODIGO
-  exigir 200 "$RESP" "paso 2 de la reautenticacion de limpieza"
-  P=$(printf '%s' "$RESP" | jget mfa_proof)
-  ok 200 "prueba emitida"
+  pedir_prueba collection_purge_batch "$R1" "para purgar la coleccion"
 
   paso "POST .../collections/{id}/purge"
-  RESP=$(api POST "${VM}/vault/collections/${C}/purge" \
-    "$(json '{"confirm": "PURGE", "reason": "limpieza del recorrido"}')")
-  exigir 204 "$RESP" "purga de la coleccion"
+  api POST "${VM}/vault/collections/${C}/purge" \
+    "$(json '{"confirm": "PURGE", "reason": "limpieza del recorrido"}')"
+  exigir 204 "purga de la coleccion"
   ok 204 "coleccion purgada"
   P=''; unset P
 
   paso "GET .../collections/{id}"
-  RESP=$(api GET "${VM}/vault/collections/${C}")
-  exigir 200 "$RESP" "estado final de la coleccion"
-  ok 200 "state=$(printf '%s' "$RESP" | jget state)"
+  api GET "${VM}/vault/collections/${C}"
+  exigir 200 "estado final de la coleccion"
+  ok 200 "state=$(campo state)"
   nota "la fila permanece como auditoria minima"
 fi
 
 paso "POST ${UM_PREFIX}/auth/logout"
-api POST "${UM}/auth/logout" >/dev/null
+api POST "${UM}/auth/logout"
 ok "$ESTADO" "sesion cerrada y token de Vault revocado"
 A=''; unset A
 
@@ -636,6 +641,31 @@ cat <<FIN
     - un esquema incompatible no crea version;
     - la purga exige confirmacion y una prueba de MFA de un solo uso;
     - ni los listados, ni el diagnostico, ni la auditoria llevan valores.
+FIN
+
+if [[ "$KEEP" == true ]]; then
+  cat <<FIN
+
+  La coleccion sigue viva. Un script no puede dejar variables en tu shell, asi
+  que para las comprobaciones manuales del README (seccion 7) copia esto:
+
+    C=${C}
+    R1=${R1}
+    PREFIJO=${PREFIJO}
+
+  Y para purgarla cuando acabes hace falta un step-up con
+  operation=collection_purge_batch y resource_ids=[${R1}].
+FIN
+else
+  cat <<FIN
+
+  Fixtures limpiados: la coleccion ${NUEVO} esta purgada y su fila permanece
+  como auditoria minima. Para repetir el recorrido con una coleccion nueva,
+  vuelve a lanzar el script.
+FIN
+fi
+
+cat <<'FIN'
 
   Lo que este recorrido NO cubre:
     - el contrato de maquina del crawler, que necesita role_id y secret_id:
