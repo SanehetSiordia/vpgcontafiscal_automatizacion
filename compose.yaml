@@ -1,5 +1,63 @@
 name: vpg-contadores
 
+
+# =============================================================================
+# Configuracion COMPARTIDA por vault-mgmt-service y su worker (etapa 4.6).
+#
+# Va en un anclaje y no duplicada en los dos servicios a proposito: los dos
+# procesos leen la MISMA configuracion y los MISMOS secretos. Si divergieran,
+# el worker podria escribir en un montaje AppRole distinto del que la API cree
+# estar gestionando, y el sintoma seria una entrega que nunca llega.
+# =============================================================================
+x-vault-mgmt-environment: &vault-mgmt-environment
+  VAULT_MGMT_ENVIRONMENT: ${VAULT_MGMT_ENVIRONMENT}
+  VAULT_MGMT_LOG_LEVEL: ${VAULT_MGMT_LOG_LEVEL}
+  VAULT_MGMT_API_PREFIX: ${VAULT_MGMT_API_PREFIX}
+  # Dentro de la red se usan nombres de servicio y puertos de contenedor.
+  VAULT_MGMT_POSTGRES_HOST: postgres-service
+  VAULT_MGMT_POSTGRES_PORT: ${POSTGRES_PORT_REMOTE}
+  VAULT_MGMT_POSTGRES_DB: ${POSTGRES_DB}
+  VAULT_MGMT_POSTGRES_USER: ${POSTGRES_APP_USER}
+  VAULT_MGMT_POSTGRES_SCHEMA: ${VAULT_MGMT_POSTGRES_SCHEMA}
+  VAULT_MGMT_POSTGRES_EMPLOYEES_SCHEMA: ${POSTGRES_SCHEMA}
+  VAULT_MGMT_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_app_password
+  VAULT_MGMT_VAULT_ADDR: http://vault-service:${VAULT_PORT_REMOTE}
+  VAULT_MGMT_KV_MOUNT: ${VAULT_MGMT_KV_MOUNT}
+  VAULT_MGMT_KV_PREFIX: ${VAULT_MGMT_KV_PREFIX}
+  VAULT_MGMT_USER_MGMT_BASE_URL: http://user-mgmt-service:${USER_MGMT_PORT_REMOTE}
+  VAULT_MGMT_INTERNAL_CREDENTIAL_FILE: /run/secrets/vault_mgmt_internal_token
+  VAULT_MGMT_WRAP_TTL_SECONDS: ${VAULT_MGMT_WRAP_TTL_SECONDS}
+  VAULT_MGMT_MAX_COLLECTION_BATCH: ${VAULT_MGMT_MAX_COLLECTION_BATCH}
+  VAULT_MGMT_MAX_VERSIONS_PER_REQUEST: ${VAULT_MGMT_MAX_VERSIONS_PER_REQUEST}
+  VAULT_MGMT_MAX_CRAWLER_RECORDS: ${VAULT_MGMT_MAX_CRAWLER_RECORDS}
+  VAULT_MGMT_MAX_RECORD_BYTES: ${VAULT_MGMT_MAX_RECORD_BYTES}
+  VAULT_MGMT_RATE_LIMIT_SESSION_PER_MINUTE: ${VAULT_MGMT_RATE_LIMIT_SESSION_PER_MINUTE}
+  VAULT_MGMT_RATE_LIMIT_CONSUMER_PER_MINUTE: ${VAULT_MGMT_RATE_LIMIT_CONSUMER_PER_MINUTE}
+  VAULT_MGMT_RATE_LIMIT_GLOBAL_PER_MINUTE: ${VAULT_MGMT_RATE_LIMIT_GLOBAL_PER_MINUTE}
+  VAULT_MGMT_RATE_LIMIT_RECEIVER_PER_MINUTE: ${VAULT_MGMT_RATE_LIMIT_RECEIVER_PER_MINUTE:-60}
+  # --- Etapa 4.6: aprovisionamiento de consumidores de maquina ---------
+  VAULT_MGMT_MANAGED_APPROLE_MOUNT: ${VAULT_CRAWLER_APPROLE_MOUNT}
+  VAULT_MGMT_MANAGED_POLICY_NAME: ${VAULT_MGMT_MANAGED_POLICY_NAME:-vpg-crawler-managed}
+  VAULT_MGMT_MANAGED_ROLE_PREFIX: ${VAULT_MGMT_MANAGED_ROLE_PREFIX:-vpg-managed-}
+  VAULT_MGMT_CRAWLER_TOKEN_TTL_SECONDS: ${VAULT_MGMT_CRAWLER_TOKEN_TTL_SECONDS:-1200}
+  VAULT_MGMT_CRAWLER_TOKEN_MAX_TTL_SECONDS: ${VAULT_MGMT_CRAWLER_TOKEN_MAX_TTL_SECONDS:-3600}
+  VAULT_MGMT_CRAWLER_SECRET_ID_TTL_SECONDS: ${VAULT_MGMT_CRAWLER_SECRET_ID_TTL_SECONDS:-604800}
+  VAULT_MGMT_CRAWLER_SECRET_ID_NUM_USES: ${VAULT_MGMT_CRAWLER_SECRET_ID_NUM_USES:-1}
+  VAULT_MGMT_PROVISIONING_WRAP_TTL_SECONDS: ${VAULT_MGMT_PROVISIONING_WRAP_TTL_SECONDS:-120}
+  VAULT_MGMT_PROVISIONING_MAX_CLAIMS: ${VAULT_MGMT_PROVISIONING_MAX_CLAIMS:-5}
+  VAULT_MGMT_RECEIVERS: ${VAULT_MGMT_RECEIVERS:-local=/run/secrets/crawler_receiver_local}
+  # Token administrativo del PERFIL LOCAL, por archivo de solo lectura.
+  # Simplificacion deliberada de desarrollo: ver readme/etapa-4-6.
+  VAULT_MGMT_VAULT_TOKEN_FILE: /run/secrets/vault_provisioner_token
+
+x-vault-mgmt-secrets: &vault-mgmt-secrets
+  - postgres_app_password
+  - vault_mgmt_internal_token
+  # Credencial del receptor configurado y token del aprovisionador. Solo
+  # este servicio y su worker los reciben: las demas APIs no.
+  - crawler_receiver_local
+  - vault_provisioner_token
+
 services:
   vault-service:
     env_file:
@@ -161,33 +219,8 @@ services:
     hostname: vault-mgmt-service
     restart: unless-stopped
     environment:
-      VAULT_MGMT_ENVIRONMENT: ${VAULT_MGMT_ENVIRONMENT}
-      VAULT_MGMT_LOG_LEVEL: ${VAULT_MGMT_LOG_LEVEL}
-      VAULT_MGMT_API_PREFIX: ${VAULT_MGMT_API_PREFIX}
-      # Dentro de la red se usan nombres de servicio y puertos de contenedor.
-      VAULT_MGMT_POSTGRES_HOST: postgres-service
-      VAULT_MGMT_POSTGRES_PORT: ${POSTGRES_PORT_REMOTE}
-      VAULT_MGMT_POSTGRES_DB: ${POSTGRES_DB}
-      VAULT_MGMT_POSTGRES_USER: ${POSTGRES_APP_USER}
-      VAULT_MGMT_POSTGRES_SCHEMA: ${VAULT_MGMT_POSTGRES_SCHEMA}
-      VAULT_MGMT_POSTGRES_EMPLOYEES_SCHEMA: ${POSTGRES_SCHEMA}
-      VAULT_MGMT_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_app_password
-      VAULT_MGMT_VAULT_ADDR: http://vault-service:${VAULT_PORT_REMOTE}
-      VAULT_MGMT_KV_MOUNT: ${VAULT_MGMT_KV_MOUNT}
-      VAULT_MGMT_KV_PREFIX: ${VAULT_MGMT_KV_PREFIX}
-      VAULT_MGMT_USER_MGMT_BASE_URL: http://user-mgmt-service:${USER_MGMT_PORT_REMOTE}
-      VAULT_MGMT_INTERNAL_CREDENTIAL_FILE: /run/secrets/vault_mgmt_internal_token
-      VAULT_MGMT_WRAP_TTL_SECONDS: ${VAULT_MGMT_WRAP_TTL_SECONDS}
-      VAULT_MGMT_MAX_COLLECTION_BATCH: ${VAULT_MGMT_MAX_COLLECTION_BATCH}
-      VAULT_MGMT_MAX_VERSIONS_PER_REQUEST: ${VAULT_MGMT_MAX_VERSIONS_PER_REQUEST}
-      VAULT_MGMT_MAX_CRAWLER_RECORDS: ${VAULT_MGMT_MAX_CRAWLER_RECORDS}
-      VAULT_MGMT_MAX_RECORD_BYTES: ${VAULT_MGMT_MAX_RECORD_BYTES}
-      VAULT_MGMT_RATE_LIMIT_SESSION_PER_MINUTE: ${VAULT_MGMT_RATE_LIMIT_SESSION_PER_MINUTE}
-      VAULT_MGMT_RATE_LIMIT_CONSUMER_PER_MINUTE: ${VAULT_MGMT_RATE_LIMIT_CONSUMER_PER_MINUTE}
-      VAULT_MGMT_RATE_LIMIT_GLOBAL_PER_MINUTE: ${VAULT_MGMT_RATE_LIMIT_GLOBAL_PER_MINUTE}
-    secrets:
-      - postgres_app_password
-      - vault_mgmt_internal_token
+      <<: *vault-mgmt-environment
+    secrets: *vault-mgmt-secrets
     ports:
       # Solo loopback del host, igual que los demas.
       - "${VAULT_MGMT_HOST_BIND}:${VAULT_MGMT_PORT_LOCAL}:${VAULT_MGMT_PORT_REMOTE}"
@@ -215,6 +248,46 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Worker de operaciones de consumidor (etapa 4.6)
+  #
+  # MISMA imagen que la API, otro comando. No atiende HTTP, no publica ningun
+  # puerto y no se llega a el desde el host: toma trabajo de PostgreSQL. Por eso
+  # no lleva healthcheck de HTTP; si muere, su arrendamiento sobre la operacion
+  # caduca y otro worker la retoma.
+  # ---------------------------------------------------------------------------
+  vault-mgmt-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: vault-mgmt-server
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION}
+    image: vpg/vault-mgmt-server:${VAULT_MGMT_VERSION}
+    container_name: ${VAULT_MGMT_WORKER_CONTAINER_NAME:-vpg-vault-mgmt-worker}
+    hostname: vault-mgmt-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.vault_mgmt.worker"]
+    environment:
+      <<: *vault-mgmt-environment
+      VAULT_MGMT_WORKER_POLL_SECONDS: ${VAULT_MGMT_WORKER_POLL_SECONDS:-2}
+      VAULT_MGMT_WORKER_BATCH: ${VAULT_MGMT_WORKER_BATCH:-5}
+      VAULT_MGMT_WORKER_LEASE_SECONDS: ${VAULT_MGMT_WORKER_LEASE_SECONDS:-60}
+      VAULT_MGMT_WORKER_MAX_ATTEMPTS: ${VAULT_MGMT_WORKER_MAX_ATTEMPTS:-3}
+    secrets: *vault-mgmt-secrets
+    networks:
+      - ${DOCKER_NETWORK_NAME}
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres-service:
+        condition: service_healthy
+      # Vault con service_started, por el mismo motivo que las APIs: arranca
+      # sellado y el unseal es manual. El worker arranca igualmente y deja las
+      # operaciones en 'pending' hasta que Vault responda.
+      vault-service:
+        condition: service_started
 
 volumes:
   vault-data:
@@ -248,3 +321,19 @@ secrets:
   # humano y no lo sustituye: las dos son obligatorias.
   vault_mgmt_internal_token:
     file: ./secrets/vault_mgmt_internal_token
+  # --- Etapa 4.6 -------------------------------------------------------------
+  # Credencial del receptor 'local', una por receptor configurado. La genera
+  # 'make all' si falta. Autentica a quien reclama una emision; el consumer_id
+  # NO sirve como credencial.
+  crawler_receiver_local:
+    file: ./secrets/crawler_receiver_local
+  # Token administrativo de Vault del PERFIL LOCAL, para que el aprovisionador
+  # pueda crear la AppRole del consumidor y emitir su SecretID.
+  #
+  # Es el mismo archivo que secrets/VAULT_INITIAL_TOKEN, montado SOLO en
+  # vault-mgmt-service y en su worker. Ni user-mgmt ni postgres lo reciben, y la
+  # clave de unseal no la recibe nadie. Es una simplificacion aceptada del
+  # entorno local, no una configuracion de produccion: lo que lo acota es el
+  # codigo (app/vault_mgmt/core/approle_admin.py), no la ACL de Vault.
+  vault_provisioner_token:
+    file: ./secrets/VAULT_INITIAL_TOKEN

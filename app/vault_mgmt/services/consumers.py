@@ -12,8 +12,22 @@ cliente (se resuelve desde la identidad del token), no se admite un path libre
 ni una URL, y no se emiten tokens de autenticacion nuevos. Si la autenticacion
 de la maquina falla, **no** hay vuelta a la cuenta tecnica del servicio.
 
-La lectura se hace con el token de **esa** maquina, de modo que la ACL de Vault
-se aplica a sus permisos, no a los de un empleado ni a los del bootstrap.
+Dos modos de lectura, y la diferencia importa
+---------------------------------------------
+* **Consumidor HEREDADO** (``delivery_mode='direct'``, etapa 4, por CLI): la
+  lectura se hace con el token de **esa** maquina, asi que la ACL de Vault
+  aplica sus permisos. El limite real de lo que puede leer es su politica, que
+  cubre todo el prefijo gestionado: sus bindings acotan lo que esta API le
+  entrega, **no** lo que su token podria leer por su cuenta. Decir lo contrario
+  seria falso.
+* **Consumidor GESTIONADO** (``delivery_mode='mediated'``, etapa 4.6): su politica **no**
+  incluye lectura del prefijo KV. La entrega es *mediada*: el backend autorizado
+  lee la version permitida por el binding y la envuelve para el. Aqui si los
+  bindings y ``pinned_version`` son el limite efectivo, porque el token del
+  consumidor no puede leer nada mas por si mismo.
+
+Migrar un consumidor heredado a entrega mediada es una decision explicita (hay
+que estrechar su politica en Vault), no algo que ocurra solo.
 """
 
 from __future__ import annotations
@@ -45,6 +59,7 @@ from app.vault_mgmt.core.machine_auth import (
     identity_from_lookup,
 )
 from app.vault_mgmt.core.principal import HumanPrincipal, require_admin
+from app.vault_mgmt.core.vault_auth import ProvisioningUnavailable, VaultTokenProvider
 from app.vault_mgmt.models.catalog import SecretConsumer
 from app.vault_mgmt.repositories import audit as audit_repo
 from app.vault_mgmt.repositories import catalog as repo
@@ -61,6 +76,9 @@ class Delivery:
     wrap_token: str
     ttl_seconds: int
     expires_at: dt.datetime
+    # True cuando la leyo el backend autorizado por cuenta del consumidor
+    # (consumidor gestionado). False cuando la leyo su propio token (heredado).
+    mediated: bool = False
 
 
 @dataclass(slots=True)
@@ -79,12 +97,17 @@ class ConsumerService:
         session_factory: async_sessionmaker[AsyncSession],
         probe: VaultProbe,
         kv_factory: Any,
+        token_provider: VaultTokenProvider | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._probe = probe
         self._kv_factory = kv_factory
         self._kv_cache: dict[str, KvV2Client] = {}
+        # Solo para la entrega MEDIADA de consumidores gestionados. Sin el, un
+        # consumidor gestionado recibe 503 en vez de una lectura con permisos
+        # que no le corresponden.
+        self._token_provider = token_provider
 
     async def aclose(self) -> None:
         for client in self._kv_cache.values():
@@ -305,9 +328,19 @@ class ConsumerService:
             mount, logical_path, version, pinned = plan
             kv = self._kv(mount)
             try:
+                reading_token = await self._reading_token(consumer, token)
                 wrapped = await kv.read_version_wrapped(
-                    token, logical_path, version=version, wrap_ttl_seconds=ttl
+                    reading_token, logical_path, version=version, wrap_ttl_seconds=ttl
                 )
+            except ProvisioningUnavailable as exc:
+                rejected.append(
+                    {
+                        "record_id": str(record_id),
+                        "code": "mediated_delivery_unavailable",
+                        "reason": exc.message,
+                    }
+                )
+                continue
             except VaultError as exc:
                 # La ACL de la maquina manda: si su politica no cubre el path,
                 # el rechazo es de Vault y se reporta como tal.
@@ -340,6 +373,7 @@ class ConsumerService:
                     ttl_seconds=wrapped.ttl_seconds,
                     expires_at=dt.datetime.now(dt.UTC)
                     + dt.timedelta(seconds=wrapped.ttl_seconds),
+                    mediated=consumer.is_mediated,
                 )
             )
             await self._audit_machine(
@@ -365,6 +399,22 @@ class ConsumerService:
             deliveries=deliveries,
             rejected=rejected,
         )
+
+    async def _reading_token(self, consumer: SecretConsumer, machine_token: str) -> str:
+        """Con que token se lee el registro, segun el tipo de consumidor.
+
+        Gestionado -> el del backend autorizado (entrega mediada), porque su
+        politica no cubre la lectura de KV. Heredado -> el suyo, como en la
+        etapa 4, de modo que la ACL de Vault aplique SUS permisos.
+        """
+        if not consumer.is_mediated:
+            return machine_token
+        if self._token_provider is None:
+            raise ProvisioningUnavailable(
+                "este consumidor usa entrega mediada y el servicio no tiene "
+                "token autorizado para leer por el"
+            )
+        return await self._token_provider.token()
 
     async def _plan_delivery(
         self,

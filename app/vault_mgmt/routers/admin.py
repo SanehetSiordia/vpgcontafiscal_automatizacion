@@ -1,4 +1,9 @@
-"""Comprobacion de acceso, operaciones, auditoria y consumidores de maquina."""
+"""Comprobacion de acceso, estado de operaciones y auditoria.
+
+Los consumidores de maquina (alta, aprovisionamiento, bindings, rotacion y
+revocacion) viven en ``app/vault_mgmt/routers/consumers.py`` desde la etapa 4.6:
+comparten el prefijo ``/vault`` y su propia etiqueta de OpenAPI.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +19,6 @@ from app.vault_mgmt.deps import (
     current_principal,
     get_access_service,
     get_app_settings,
-    get_consumer_service,
     get_record_service,
     get_request_id,
     rate_limit_global,
@@ -26,15 +30,8 @@ from app.vault_mgmt.schemas.common import (
     OperationOut,
     PageMeta,
 )
-from app.vault_mgmt.schemas.crawler import (
-    BindingOut,
-    BindingsOut,
-    BindingsPutIn,
-    ConsumerOut,
-)
 from app.vault_mgmt.schemas.records import AccessCheckIn, AccessCheckOut
 from app.vault_mgmt.services.access import AccessService
-from app.vault_mgmt.services.consumers import ConsumerService
 from app.vault_mgmt.services.records import RecordService
 
 router = APIRouter(
@@ -141,97 +138,4 @@ async def list_audit(
             returned=len(page.items),
         ),
         items=[AuditEntryOut.model_validate(item) for item in page.items],
-    )
-
-
-@router.put(
-    "/consumers/{consumer_id}/bindings",
-    response_model=BindingsOut,
-    summary="Registros y versiones autorizados para una maquina (solo admin)",
-    description=(
-        "Reemplazo **completo** del conjunto de asignaciones: lo que no venga en "
-        "la lista deja de estar autorizado.\n\n"
-        "La identidad de maquina es **preconfigurada**: la crea "
-        "`scripts/vault_mgmt/crawler-approle-bootstrap.sh`, no esta API. Aqui solo "
-        "se decide **que** puede resolver.\n\n"
-        "`pinned_version` fija la version; ausente significa `latest`, que cambia "
-        "cuando se escribe otra version.\n\n"
-        "Revocar impide **entregas futuras**. No caduca un wrapping token ya "
-        "entregado, no revoca el token AppRole del consumidor y no borra lo que ya "
-        "leyo: para cortar de raiz hay que revocar su AppRole en Vault."
-    ),
-)
-async def put_bindings(
-    consumer_id: Annotated[uuid.UUID, Path(description="UUID del consumidor.")],
-    payload: BindingsPutIn,
-    principal: Annotated[HumanPrincipal, Depends(current_principal)],
-    service: Annotated[ConsumerService, Depends(get_consumer_service)],
-    request_id: Annotated[str, Depends(get_request_id)],
-) -> BindingsOut:
-    consumer, bindings = await service.put_bindings(
-        principal=principal,
-        consumer_id=consumer_id,
-        entries=[
-            (item.collection_id, item.record_id, item.pinned_version)
-            for item in payload.bindings
-        ],
-        request_id=request_id,
-    )
-    return BindingsOut(
-        consumer=ConsumerOut.model_validate(consumer),
-        bindings=[
-            BindingOut(
-                binding_id=item.binding_id,
-                collection_id=item.collection_id,
-                record_id=item.record_id,
-                pinned_version=item.pinned_version,
-                resolves_to=(
-                    f"version fijada {item.pinned_version}"
-                    if item.pinned_version
-                    else "latest"
-                ),
-                created_at=item.created_at,
-            )
-            for item in bindings
-        ],
-        total=len(bindings),
-    )
-
-
-@router.get(
-    "/consumers/{consumer_id}/bindings",
-    response_model=BindingsOut,
-    summary="Referencias y alcance de una maquina, sin credenciales (solo admin)",
-    description=(
-        "No devuelve `role_id` ni `secret_id`: no se guardan en este servicio. "
-        "Los crea y los entrega el script de bootstrap del consumidor."
-    ),
-)
-async def get_bindings(
-    consumer_id: Annotated[uuid.UUID, Path()],
-    principal: Annotated[HumanPrincipal, Depends(current_principal)],
-    service: Annotated[ConsumerService, Depends(get_consumer_service)],
-) -> BindingsOut:
-    consumer, bindings, names = await service.get_bindings(
-        principal=principal, consumer_id=consumer_id
-    )
-    return BindingsOut(
-        consumer=ConsumerOut.model_validate(consumer),
-        bindings=[
-            BindingOut(
-                binding_id=item.binding_id,
-                collection_id=item.collection_id,
-                collection_name=names.get(item.collection_id),
-                record_id=item.record_id,
-                pinned_version=item.pinned_version,
-                resolves_to=(
-                    f"version fijada {item.pinned_version}"
-                    if item.pinned_version
-                    else "latest"
-                ),
-                created_at=item.created_at,
-            )
-            for item in bindings
-        ],
-        total=len(bindings),
     )

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Aplica la migracion 003 (esquema vault_mgmt) con la cuenta ADMINISTRATIVA y
-# comprueba que los permisos DML de la cuenta de ejecucion son los minimos.
+# Aplica las migraciones 003 y 004 (esquema vault_mgmt) con la cuenta
+# ADMINISTRATIVA y comprueba que los permisos DML de la cuenta de ejecucion son
+# los minimos.
+#
+#   003_vault_mgmt.sql          catalogo de colecciones, registros y consumidores
+#   004_crawler_provisioning.sql aprovisionamiento automatico (etapa 4.6)
 #
 # Uso (host, Git Bash, desde la raiz del repositorio):
 #   bash scripts/vault_mgmt/apply-migrations.sh
@@ -50,6 +54,15 @@ docker compose exec -T postgres-service \
   | grep -viE 'already exists, skipping|does not exist, skipping' || true
 
 echo
+echo "==> Aplicando 004_crawler_provisioning.sql en ${PG_DB} como ${PG_USER}"
+echo "    (consumer_deliveries, alcance de consumidor en secret_operations y"
+echo "     los estados waiting_receiver / awaiting_ack)"
+docker compose exec -T postgres-service \
+  psql -v ON_ERROR_STOP=1 -v app_user="$PG_APP" --no-psqlrc --quiet \
+       --username "$PG_USER" --dbname "$PG_DB" < "${REPO_ROOT}/sql/004_crawler_provisioning.sql" \
+  | grep -viE 'already exists, skipping|does not exist, skipping' || true
+
+echo
 echo "==> Tablas del esquema ${VM_SCHEMA}"
 docker compose exec -T postgres-service \
   psql --no-psqlrc -U "$PG_USER" -d "$PG_DB" -c "
@@ -81,3 +94,5 @@ echo
 echo "==> Listo. Siguiente paso:"
 echo "      bash scripts/vault_mgmt/vault-kv-policies.sh   # politicas KV v2"
 echo "      bash scripts/vault_mgmt/prepare-internal-secret.sh"
+echo "      make all                                       # genera la credencial"
+echo "                                                     # de cada receptor 4.6"

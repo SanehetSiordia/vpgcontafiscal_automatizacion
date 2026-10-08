@@ -427,8 +427,11 @@ bash scripts/vault_mgmt/apply-migrations.sh
 bash scripts/vault_mgmt/prepare-internal-secret.sh
 ```
 
-Resultado esperado de la migración 003: las siete tablas y esta tabla de
-permisos, que es la comprobación que importa.
+Resultado esperado de la migración 003: sus siete tablas y esta tabla de
+permisos, que es la comprobación que importa. Desde la
+[etapa 4.6](etapa-4-6-aprovisionamiento.md) el mismo script aplica también la
+migración 004, que añade dos tablas más (`secret_receivers` y
+`secret_provisioning_deliveries`): en total nueve.
 
 ```
            tabla           | sel | ins | upd | del | trunc
@@ -1003,9 +1006,21 @@ valores en ningún modo.
 
 ### 11. 🖐 INTERACTIVO — Consumo por el cliente CLI de la máquina
 
+Este recorrido es el del consumidor **heredado** (`delivery_mode` `direct`),
+que lee el prefijo KV con su propio token. El alta y el aprovisionamiento por
+API, con entrega mediada, están en la
+[etapa 4.6](etapa-4-6-aprovisionamiento.md).
+
 ```bash
-# El bootstrap muestra role_id y secret_id UNA vez y registra el consumer_id
+# Registra el consumidor y muestra su role_id. Desde la etapa 4.6 NO emite
+# ningun secret_id salvo que se pida: emitir uno en cada ejecucion acumulaba
+# credenciales validas que nadie controlaba.
 bash scripts/vault_mgmt/crawler-approle-bootstrap.sh
+
+# Para obtener un secret_id de forma explicita (y, opcionalmente, dejar solo
+# el nuevo destruyendo los anteriores por su accessor):
+bash scripts/vault_mgmt/crawler-approle-bootstrap.sh --rotate-secret-id
+bash scripts/vault_mgmt/crawler-approle-bootstrap.sh --rotate-secret-id --destroy-previous
 
 # Asignarle registros (solo admin, con su api_session)
 curl -s -X PUT "$VM/vault/consumers/'<consumer_id>'/bindings" -H "$A" \

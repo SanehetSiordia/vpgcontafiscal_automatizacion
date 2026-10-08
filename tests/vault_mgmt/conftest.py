@@ -87,7 +87,10 @@ from app.vault_mgmt.services.catalog import CatalogService  # noqa: E402
 from app.vault_mgmt.services.consumers import ConsumerService  # noqa: E402
 from app.vault_mgmt.services.lifecycle import LifecycleService  # noqa: E402
 from app.vault_mgmt.services.records import RecordService  # noqa: E402
+from app.vault_mgmt.core.receiver_auth import ReceiverRegistry  # noqa: E402
+from app.vault_mgmt.services.provisioning import ProvisioningService  # noqa: E402
 from tests.conftest import TEST_ACCESSOR, TEST_ENFORCEMENT, TEST_METHOD_ID  # noqa: E402
+from tests.vault_mgmt.fakes_provisioning import FakeAppRole  # noqa: E402
 
 INTERNAL_CREDENTIAL = "credencial-interna-solo-para-pruebas"
 
@@ -436,8 +439,64 @@ def probe() -> FakeProbe:
     return FakeProbe()
 
 
+# Credencial del receptor de pruebas. Se inyecta ya resuelta en los ajustes, de
+# la misma forma que en produccion se resuelve del archivo montado: asi la
+# prueba ejercita la comparacion real y no un atajo.
+class _StaticProvider:
+    """Proveedor de token para la entrega mediada en pruebas."""
+
+    def __init__(self, token: str) -> None:
+        self._token = token
+        self.available = True
+        self.description = "token fijo de pruebas"
+
+    async def token(self) -> str:
+        return self._token
+
+    async def invalidate(self) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+
+#
+# Es UNICO por prueba, y no por casualidad: un receptor sirve a un solo
+# consumidor (indice secret_receivers_name_ux), y la cuenta de ejecucion no
+# puede borrar filas de consumidores ni de receptores. Compartir un nombre entre
+# pruebas haria que la primera se quedase el receptor y el resto fallase con
+# 409, que es exactamente el invariante que se quiere comprobar... una sola vez.
+class ReceiverFixture:
+    """Receptor de pruebas: su nombre y su credencial."""
+
+    def __init__(self, name: str, credential: str) -> None:
+        self.name = name
+        self.credential = credential
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {"X-VPG-Receiver-Credential": self.credential}
+
+    @property
+    def credential_file(self) -> str:
+        return f"/run/secrets/crawler_receiver_{self.name}"
+
+
+@pytest.fixture
+def receiver() -> ReceiverFixture:
+    marca = uuid.uuid4().hex[:10]
+    return ReceiverFixture(
+        name=f"receptor-{marca}", credential=f"credencial-de-pruebas-{marca}-" + "x" * 24
+    )
+
+
+@pytest.fixture
+def approle(probe) -> FakeAppRole:
+    return FakeAppRole(get_vault_mgmt_settings(), probe)
+
+
 @pytest_asyncio.fixture
-async def apps(vm_engine, kv, probe, vault, seeded):
+async def apps(vm_engine, kv, probe, approle, receiver, vault, seeded):
     """Las dos apps conectadas: vault-mgmt -> pasarela real de user-mgmt.
 
     El doble de KV es el MISMO objeto en los dos lados: la pasarela lo usa para
@@ -447,6 +506,13 @@ async def apps(vm_engine, kv, probe, vault, seeded):
     """
     settings = get_vault_mgmt_settings()
     settings.__dict__["internal_credential"] = SecretStr(INTERNAL_CREDENTIAL)
+    # Receptor configurado, con su credencial ya resuelta (en produccion sale de
+    # un archivo montado). receiver_entries deriva de `receivers`, asi que se
+    # fija el texto y la credencial por separado.
+    settings.__dict__["receivers"] = f"{receiver.name}={receiver.credential_file}"
+    settings.__dict__["receiver_credentials"] = {
+        receiver.name: SecretStr(receiver.credential)
+    }
 
     # user-mgmt, montado a mano (sin lifespan).
     um_app = await _build_user_mgmt(vault, seeded, kv)
@@ -476,11 +542,19 @@ async def apps(vm_engine, kv, probe, vault, seeded):
     vm_app.state.access_service = AccessService(
         settings=settings, session_factory=factory, gateway=gateway
     )
+    vm_app.state.approle = approle
+    vm_app.state.receivers = ReceiverRegistry(settings)
+    vm_app.state.provisioning_service = ProvisioningService(
+        settings=settings, session_factory=factory, approle=approle
+    )
     vm_app.state.consumer_service = ConsumerService(
         settings=settings,
         session_factory=factory,
         probe=probe,
         kv_factory=lambda mount: kv,
+        # Entrega mediada: el "token autorizado" del backend es un valor fijo en
+        # pruebas, y el doble de KV lo acepta igual que cualquier otro.
+        token_provider=_StaticProvider("token-del-aprovisionador"),
     )
 
     readiness = ReadinessState(settings)
@@ -491,11 +565,20 @@ async def apps(vm_engine, kv, probe, vault, seeded):
         vault_unsealed=True,
         user_mgmt_ready=True,
         gateway_authenticated=True,
+        provisioning_enabled=True,
+        receivers_configured=True,
     )
     vm_app.state.readiness = readiness
 
     try:
-        yield {"user_mgmt": um_app, "vault_mgmt": vm_app, "kv": kv, "probe": probe}
+        yield {
+            "user_mgmt": um_app,
+            "vault_mgmt": vm_app,
+            "kv": kv,
+            "probe": probe,
+            "approle": approle,
+            "receiver": receiver,
+        }
     finally:
         await um_client.aclose()
 
@@ -649,6 +732,24 @@ async def step_up(
 
 def auth(session_id: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {session_id}"}
+
+
+def receiver_auth(credential: str) -> dict[str, str]:
+    """Cabecera del canal interno de aprovisionamiento.
+
+    Es otra credencial y otra cabecera que el Bearer humano, a proposito: una
+    api_session no sirve aqui y esta no sirve en los endpoints humanos.
+    """
+    return {"X-VPG-Receiver-Credential": credential}
+
+
+def consumer_name(prefix: str = "crawler") -> str:
+    """Nombre de consumidor unico y valido para el CHECK de la migracion 003.
+
+    Sin '/' (que si admite un nombre logico de coleccion) porque el nombre del
+    consumidor se usa para derivar el del rol AppRole.
+    """
+    return f"{prefix}-{uuid.uuid4().hex[:10]}"
 
 
 def unique_name(prefix: str = "test") -> str:

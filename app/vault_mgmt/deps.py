@@ -26,10 +26,12 @@ from app.vault_mgmt.core.gateway_client import GatewayClient
 from app.vault_mgmt.core.machine_auth import VaultProbe
 from app.vault_mgmt.core.principal import HumanPrincipal
 from app.vault_mgmt.core.readiness import ReadinessState
+from app.vault_mgmt.core.receiver_auth import ReceiverRegistry
 from app.vault_mgmt.services.access import AccessService
 from app.vault_mgmt.services.catalog import CatalogService
 from app.vault_mgmt.services.consumers import ConsumerService
 from app.vault_mgmt.services.lifecycle import LifecycleService
+from app.vault_mgmt.services.provisioning import ProvisioningService
 from app.vault_mgmt.services.records import RecordService
 
 human_scheme = HTTPBearer(
@@ -93,6 +95,14 @@ def get_access_service(request: Request) -> AccessService:
     return request.app.state.access_service
 
 
+def get_provisioning_service(request: Request) -> ProvisioningService:
+    return request.app.state.provisioning_service
+
+
+def get_receivers(request: Request) -> ReceiverRegistry:
+    return request.app.state.receivers
+
+
 def get_request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
 
@@ -134,6 +144,26 @@ async def rate_limit_global(
     client = request.client.host if request.client else "desconocido"
     await _enforce_limit(
         limiter, f"global:{client}", settings.rate_limit_global_per_minute, "global"
+    )
+
+
+async def rate_limit_receiver(
+    request: Request,
+    limiter: Annotated[SlidingWindowLimiter, Depends(get_limiter)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> None:
+    """Limite del canal interno, por origen.
+
+    La clave es la IP del cliente y NO la credencial presentada: contar por
+    credencial obligaria a usarla como parte de una clave de diccionario, y una
+    credencial no tiene por que acabar en una estructura de contabilidad.
+    """
+    client = request.client.host if request.client else "desconocido"
+    await _enforce_limit(
+        limiter,
+        f"receiver:{client}",
+        settings.rate_limit_receiver_per_minute,
+        "receptor",
     )
 
 

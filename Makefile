@@ -14,7 +14,11 @@
 # USO (Git Bash). Funciona desde cualquier directorio: el Makefile fija su raiz.
 #
 #   make            Igual que 'make all' (objetivo predeterminado).
-#   make config     PASO PREVIO, una sola vez por volumen de Vault: deja las
+#   make help       Resumen de estos objetivos y de las variables de tiempo.
+#   make config     ALIAS COMPATIBLE. Desde la etapa 4.6, 'make all' ya hace la
+#                   primera inicializacion por su cuenta, asi que este objetivo
+#                   solo hace falta para preparar Vault SIN arrancar el resto.
+#                   Lo que hace, una sola vez por volumen de Vault: deja las
 #                   credenciales de Vault en archivos del proyecto para que el
 #                   arranque no necesite a nadie delante.
 #                     secrets/VAULT_UNSEAL_KEY     clave de desbloqueo
@@ -25,11 +29,15 @@
 #                   teclado (entrada oculta), la PRUEBA y solo entonces la
 #                   guarda. No sobrescribe archivos que ya existan.
 #   make all        Valida herramientas, resuelve imagenes, arranca PostgreSQL
-#                   y Vault, DESBLOQUEA Vault con secrets/VAULT_UNSEAL_KEY y
-#                   abre sesion con secrets/VAULT_INITIAL_TOKEN, aplica lo que
-#                   falte de migraciones y credenciales tecnicas, comprueba el
-#                   administrador y levanta las dos APIs en orden. Sin esos
-#                   archivos vuelve al desbloqueo manual y lo dice.
+#                   y Vault, INICIALIZA Vault si el volumen es NUEVO, lo
+#                   DESBLOQUEA con secrets/VAULT_UNSEAL_KEY y abre sesion con
+#                   secrets/VAULT_INITIAL_TOKEN, aplica lo que falte de
+#                   migraciones y credenciales tecnicas (incluida la credencial
+#                   de cada receptor de la etapa 4.6), comprueba el
+#                   administrador y levanta las dos APIs y el worker de
+#                   aprovisionamiento. Un volumen YA inicializado nunca se
+#                   reinicializa; si falta su Unseal Key, la pide una vez,
+#                   porque Vault no la vuelve a mostrar.
 #   make down       Detiene y elimina contenedores y red. CONSERVA volumenes,
 #                   imagenes, cache de build, secretos y la inicializacion de
 #                   Vault. Funciona con los servicios ya detenidos.
@@ -40,7 +48,7 @@
 #                   Sin terminal interactiva:
 #                     make purge PURGE_CONFIRM=vpg-contadores
 #
-# Solo esos cuatro objetivos son publicos. Los '.paso-NN-*' son el desglose
+# Solo esos cinco objetivos son publicos. Los '.paso-NN-*' son el desglose
 # interno de 'make all' y no se invocan a mano.
 #
 # -----------------------------------------------------------------------------
@@ -69,9 +77,13 @@
 # -----------------------------------------------------------------------------
 # LO QUE ESTE MAKEFILE NO HACE, A PROPOSITO
 #
-#   * No inicializa Vault por su cuenta en 'make all': eso solo lo hace
-#     'make config', de forma explicita y una vez por volumen. 'make all'
-#     desbloquea con el archivo si existe, y si no, pide el paso manual.
+#   * No REINICIALIZA Vault. 'make all' inicializa solo un volumen nuevo (sin
+#     inicializar y sin credenciales a medias en secrets/). Sobre un volumen con
+#     datos, 'vault operator init' no se ejecuta jamas: seria destructivo y no
+#     recuperaria la Unseal Key, que Vault no vuelve a mostrar.
+#   * No rota credenciales que ya valen: ni el SecretID de la AppRole de
+#     user-mgmt, ni la credencial de la pasarela, ni la de un receptor, ni el
+#     SecretID del crawler. Reiniciar infraestructura no es rotar nada.
 #   * No crea el administrador, ni siembra datos, ni resetea TOTP, ni sincroniza
 #     contrasenas. Si falta el administrador, aborta ANTES de iniciar las APIs e
 #     indica los scripts exactos.
@@ -333,7 +345,10 @@ VM_PORT=$$(env_req VAULT_MGMT_PORT_LOCAL)
 UM_URL="http://$$UM_BIND:$$UM_PORT"
 VM_URL="http://$$VM_BIND:$$VM_PORT"
 TABLAS_EMPLEADOS="users roles user_roles user_profiles user_phones user_addresses user_emails vault_auth_config user_vault_identity vault_operations"
-TABLAS_CATALOGO="secret_collections secret_collection_schemas secret_records secret_consumers secret_consumer_bindings secret_operations secret_audit"
+TABLAS_CATALOGO="secret_collections secret_collection_schemas secret_records secret_consumers secret_consumer_bindings secret_operations secret_audit secret_receivers secret_provisioning_deliveries"
+# Receptores de la etapa 4.6. Su credencial se genera si falta y NO se rota.
+RECEPTORES=$$(env_get VAULT_MGMT_RECEIVERS)
+RECEPTORES=$${RECEPTORES:-local=/run/secrets/crawler_receiver_local}
 
 # ---- puertos: colision con otro proyecto o con un proceso del host ---------
 puerto_libre() {
@@ -674,6 +689,43 @@ configurar_credenciales_vault() {
   fi
   capturar_credenciales_existentes
 }
+# ---- etapa 4.6: credenciales de los receptores configurados ---------------
+# Una credencial aleatoria POR RECEPTOR. Se genera si falta y NO se rota si ya
+# existe: rotarla en cada arranque dejaria fuera al receptor que ya la tiene.
+# El valor no se imprime y no pasa por los argumentos de ningun proceso.
+generar_credencial_receptor() {
+  local receptor="$$1" ruta_contenedor="$$2" ruta archivo valor
+  archivo=$${ruta_contenedor##*/}
+  ruta="$$ROOT/secrets/$$archivo"
+  if [ -s "$$ruta" ]; then
+    skip "credencial del receptor '$$receptor': ya existe en secrets/$$archivo (no se rota una credencial valida)"
+    return 0
+  fi
+  mkdir -p "$$ROOT/secrets" || die "no se puede crear $$ROOT/secrets"
+  chmod 700 "$$ROOT/secrets" 2>/dev/null || true
+  # 512 bytes de una vez y luego se filtran: con 'tr < /dev/urandom | head -c'
+  # head cierra la tuberia, tr recibe SIGPIPE y el pipeline falla con pipefail.
+  valor=$$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c 1-48)
+  [ $${#valor} -ge 32 ] || die "no se pudo generar una credencial aleatoria para '$$receptor'"
+  printf '%s' "$$valor" > "$$ruta" || die "no se pudo escribir secrets/$$archivo"
+  chmod 600 "$$ruta" 2>/dev/null || true
+  valor=""
+  ok "credencial del receptor '$$receptor' generada en secrets/$$archivo (no se imprime)"
+}
+credenciales_receptores() {
+  local entrada receptor ruta
+  local IFS=,
+  for entrada in $$RECEPTORES; do
+    entrada=$${entrada# }; entrada=$${entrada% }
+    [ -n "$$entrada" ] || continue
+    receptor=$${entrada%%=*}
+    ruta=$${entrada#*=}
+    [ -n "$$receptor" ] && [ -n "$$ruta" ] ||
+      die "VAULT_MGMT_RECEIVERS mal formado: cada receptor es '<nombre>=<ruta>', separados por comas"
+    generar_credencial_receptor "$$receptor" "$$ruta"
+  done
+}
+
 iniciar_sesion_vault() {
   if [ -s "$$ARCHIVO_TOKEN" ]; then
     dc exec -T vault-service vault login -no-print - < "$$ARCHIVO_TOKEN" >/dev/null 2>&1 || true
@@ -933,7 +985,17 @@ borrar_secreto_generado() {
 }
 retirar_credenciales_desechables() {
   local nombre
-  for nombre in postgres_password postgres_app_password vault_role_id vault_secret_id vault_mgmt_internal_token VAULT_UNSEAL_KEY VAULT_INITIAL_TOKEN; do
+  # crawler_receiver_* son las credenciales de receptor de la etapa 4.6: no
+  # dependen de un volumen, pero dejan de valer cuando desaparece el catalogo
+  # de consumidores, que vive en el volumen de PostgreSQL.
+  local receptores="" entrada archivo
+  local IFS=,
+  for entrada in $$RECEPTORES; do
+    archivo=$${entrada#*=}; archivo=$${archivo##*/}
+    [ -n "$$archivo" ] && receptores="$$receptores $$archivo"
+  done
+  unset IFS
+  for nombre in postgres_password postgres_app_password vault_role_id vault_secret_id vault_mgmt_internal_token $$receptores VAULT_UNSEAL_KEY VAULT_INITIAL_TOKEN; do
     case "$$nombre" in
       postgres_password|postgres_app_password)
         if docker volume inspect "$$VOL_PG" >/dev/null 2>&1; then
@@ -943,6 +1005,11 @@ retirar_credenciales_desechables() {
       vault_role_id|vault_secret_id)
         if docker volume inspect "$$VOL_VAULT" >/dev/null 2>&1; then
           info "secrets/$$nombre se conserva: el volumen de Vault sigue existiendo y la AppRole todavia vale"
+          continue
+        fi ;;
+      crawler_receiver_*)
+        if docker volume inspect "$$VOL_PG" >/dev/null 2>&1; then
+          info "secrets/$$nombre se conserva: el volumen de PostgreSQL sigue existiendo y el consumidor al que sirve ese receptor todavia esta en el catalogo"
           continue
         fi ;;
       VAULT_UNSEAL_KEY|VAULT_INITIAL_TOKEN)
@@ -1013,7 +1080,42 @@ PASOS := .paso-01-validar .paso-02-imagenes .paso-03-arranque .paso-04-postgres 
          .paso-05-vault .paso-06-migraciones .paso-07-administrador \
          .paso-08-credenciales .paso-09-apis .paso-10-resumen
 
-.PHONY: all config down purge $(PASOS)
+.PHONY: all help config down purge $(PASOS)
+
+# =============================================================================
+# make help - que hace cada objetivo publico
+#
+# Los '.paso-NN-*' no se listan: son el desglose interno de 'make all' y no se
+# invocan a mano.
+# =============================================================================
+help:
+	@printf '\nVPG Contadores - objetivos del Makefile (Git Bash, Docker Desktop)\n\n'
+	@printf '  make all      Arranque completo y repetible. Valida herramientas, resuelve\n'
+	@printf '                imagenes, arranca PostgreSQL y Vault, INICIALIZA Vault si el\n'
+	@printf '                volumen es nuevo, lo desbloquea con secrets/VAULT_UNSEAL_KEY,\n'
+	@printf '                aplica las migraciones que falten, comprueba el administrador\n'
+	@printf '                y levanta las dos APIs y el worker. Es el objetivo por omision.\n\n'
+	@printf '  make help     Esta ayuda.\n\n'
+	@printf '  make config   Alias compatible: deja Vault inicializado y con sus credenciales\n'
+	@printf '                en secrets/. Desde la etapa 4.6 make all ya hace esto solo, asi\n'
+	@printf '                que config solo hace falta para preparar Vault sin arrancar el\n'
+	@printf '                resto del sistema.\n\n'
+	@printf '  make down     Detiene y elimina contenedores y red. CONSERVA volumenes,\n'
+	@printf '                imagenes, cache de build, secretos y la inicializacion de Vault.\n\n'
+	@printf '  make purge    DESTRUCTIVO. Borra los volumenes de Vault y PostgreSQL, las\n'
+	@printf '                imagenes propias y las credenciales de secrets/ que dependian de\n'
+	@printf '                ellos. Inventaria, muestra lo que borrara y pide confirmacion:\n'
+	@printf '                  make purge PURGE_CONFIRM=vpg-contadores   (sin terminal)\n\n'
+	@printf 'Tiempos maximos ajustables en la linea de ordenes (segundos):\n'
+	@printf '  PG_TIMEOUT PULL_TIMEOUT BUILD_TIMEOUT VAULT_TIMEOUT UNSEAL_TIMEOUT API_TIMEOUT\n'
+	@printf '  LOCK_STALE   p. ej.:  make all PG_TIMEOUT=300\n\n'
+	@printf 'Lo que NO hace este Makefile, a proposito: no crea el administrador, no siembra\n'
+	@printf 'datos, no resetea TOTP, no emite DDL por su cuenta, no imprime secretos y no\n'
+	@printf 'ejecuta limpieza global de Docker.\n\n'
+	@printf 'Recorridos interactivos (no forman parte del arranque):\n'
+	@printf '  bash scripts/vault_mgmt/walkthrough.sh              CRUD de secretos, pide TOTP\n'
+	@printf '  bash scripts/vault_mgmt/provisioning-walkthrough.sh aprovisionamiento 4.6\n'
+	@printf '  bash scripts/postgres/verify-vault-mfa.sh           login userpass + TOTP real\n\n'
 
 # =============================================================================
 # make config - paso previo: credenciales de Vault en archivos del proyecto
@@ -1190,15 +1292,30 @@ all: $(PASOS)
 	tomar_bloqueo
 	step "5/10 Vault: accesible, inicializado y desbloqueado"
 	esperar_vault_accesible $(VAULT_TIMEOUT)
+	# Etapa 4.6: 'make all' SI inicializa, pero SOLO un volumen nuevo.
+	#
+	# El limite no se ha relajado, se ha hecho explicito. Se inicializa unicamente
+	# cuando Vault dice que NO esta inicializado y en secrets/ no hay credenciales
+	# a medias. Un volumen YA inicializado no se reinicializa nunca (perderia los
+	# datos) y unas credenciales existentes no se sobrescriben solas (serian de
+	# otro volumen). 'make config' sigue existiendo y hace exactamente esto.
 	if vault_campo_falso initialized; then
 	  if [ -s "$$ARCHIVO_UNSEAL" ] || [ -s "$$ARCHIVO_TOKEN" ]; then
 	    printf '             Si esas credenciales ya no valen, borralas y vuelve a empezar:\n' >&2
-	    printf '               rm -f secrets/VAULT_UNSEAL_KEY secrets/VAULT_INITIAL_TOKEN && make config\n' >&2
+	    printf '               rm -f secrets/VAULT_UNSEAL_KEY secrets/VAULT_INITIAL_TOKEN && make all\n' >&2
 	    die "Vault esta SIN inicializar pero en secrets/ ya hay credenciales de Vault: son de otro volumen. No se sobrescriben solas ni se inicializa encima"
 	  fi
-	  printf '             Ejecuta el paso previo, que lo inicializa y guarda sus credenciales:\n' >&2
-	  printf '               make config\n' >&2
-	  die "Vault esta SIN inicializar. 'make all' no inicializa Vault: eso es trabajo de 'make config', una sola vez por volumen"
+	  info "Vault esta SIN inicializar: es un volumen nuevo. Se inicializa ahora y sus credenciales se guardan en secrets/ sin imprimirlas"
+	  configurar_credenciales_vault
+	  vault_estado || true
+	elif [ ! -s "$$ARCHIVO_UNSEAL" ] && vault_campo_cierto sealed; then
+	  # Inicializado y sellado, pero sin su clave. Vault NO la vuelve a mostrar:
+	  # repetir 'operator init' no la recupera y sobre un volumen con datos seria
+	  # destructivo. Se pide una vez, se PRUEBA desbloqueando y solo entonces se
+	  # guarda. Sin terminal interactiva se dice como suministrarla a mano.
+	  info "Vault ya estaba inicializado y falta secrets/VAULT_UNSEAL_KEY: esa clave no se recupera reejecutando init, hay que suministrarla una vez"
+	  capturar_credenciales_existentes
+	  vault_estado || true
 	fi
 	if vault_campo_cierto sealed; then
 	  if [ -s "$$ARCHIVO_UNSEAL" ]; then
@@ -1258,7 +1375,7 @@ all: $(PASOS)
 	  [ -z "$$faltan" ] || die "tras aplicar 003 siguen faltando tablas en $$VM_SCHEMA: $$faltan"
 	  ok "migracion 003 aplicada"
 	else
-	  skip "migracion 003: las 7 tablas de $$VM_SCHEMA ya existen"
+	  skip "migraciones 003 y 004: las 9 tablas de $$VM_SCHEMA ya existen"
 	fi
 	invariante_permisos "$$PG_SCHEMA" scripts/user_mgmt/apply-migrations.sh
 	invariante_permisos "$$VM_SCHEMA" scripts/vault_mgmt/apply-migrations.sh
@@ -1343,13 +1460,19 @@ all: $(PASOS)
 	  [ -s secrets/vault_mgmt_internal_token ] || die "no se genero secrets/vault_mgmt_internal_token"
 	  ok "credencial interna de la pasarela preparada"
 	fi
+	credenciales_receptores
+	if [ -s "$$ARCHIVO_TOKEN" ]; then
+	  ok "token del aprovisionador disponible: secrets/VAULT_INITIAL_TOKEN se monta en SOLO LECTURA en vault-mgmt-service y su worker (no en las demas APIs). Simplificacion del perfil local, no de produccion"
+	else
+	  warn "sin secrets/VAULT_INITIAL_TOKEN: el aprovisionamiento quedara desactivado y las altas de consumidores se quedaran en pending. Readiness lo dira"
+	fi
 	skip "politicas KV v2 (scripts/vault_mgmt/vault-kv-policies.sh) y AppRole del crawler (scripts/vault_mgmt/crawler-approle-bootstrap.sh): no son requisito del arranque, readiness no las exige. Se ejecutan a mano cuando haga falta operar el CRUD humano o activar el consumidor"
 
 # --- 9. Las dos APIs, en orden y con readiness real -------------------------
 .paso-09-apis:
 	@$(CARGA)
 	tomar_bloqueo
-	step "9/10 APIs en orden: primero user-mgmt-service, despues vault-mgmt-service"
+	step "9/10 APIs en orden y worker de aprovisionamiento"
 	docker_vivo
 	act "docker compose up -d --no-build user-mgmt-service"
 	dc up -d --no-build user-mgmt-service || die "Compose no pudo arrancar user-mgmt-service"
@@ -1365,6 +1488,17 @@ all: $(PASOS)
 	  vault_unsealed user_mgmt_ready internal_gateway_authenticated
 	ok "vault-mgmt-service listo: catalogo migrado, Vault desbloqueado, user-mgmt listo y pasarela interna autenticada"
 	dns_interno vault-mgmt-service "postgres-service vault-service user-mgmt-service"
+	# El worker va DESPUES de vault-mgmt-service y con el mismo cuidado: comparte
+	# su imagen, asi que si la API arranco, la imagen ya esta construida.
+	act "docker compose up -d --no-build vault-mgmt-worker"
+	dc up -d --no-build vault-mgmt-worker || die "Compose no pudo arrancar vault-mgmt-worker"
+	worker_estado=$$(dc ps --format '{{.Service}} {{.State}}' 2>/dev/null | sed -n 's/^vault-mgmt-worker //p' | head -n 1 | tr -d '\r')
+	case "$$worker_estado" in
+	  running)
+	    ok "vault-mgmt-worker en marcha: procesa las operaciones de consumidor pendientes en PostgreSQL (no atiende HTTP y no publica puerto)" ;;
+	  *)
+	    anotar_fallo "vault-mgmt-worker no esta running (estado: $${worker_estado:-desconocido}). Las solicitudes de consumidor se guardaran y quedaran en pending. Log: docker compose logs vault-mgmt-worker" ;;
+	esac
 
 # --- 10. Resumen y liberacion del bloqueo -----------------------------------
 .paso-10-resumen:
@@ -1378,6 +1512,7 @@ all: $(PASOS)
 	printf '     postgres-service ...: %s:%s\n' "$$PG_BIND" "$$PG_PORT"
 	printf '     user-mgmt-service ..: %s:%s        docs %s/docs\n' "$$UM_BIND" "$$UM_PORT" "$$UM_URL"
 	printf '     vault-mgmt-service .: %s:%s        docs %s/docs   redoc %s/redoc\n' "$$VM_BIND" "$$VM_PORT" "$$VM_URL" "$$VM_URL"
+	printf '     vault-mgmt-worker ..: sin puerto; procesa la cola de operaciones\n'
 	printf '\n   Comprobaciones de esta ejecucion:\n'
 	if [ -s "$$RESUMEN" ]; then sed 's/^/     - /' "$$RESUMEN"; else printf '     (sin registro)\n'; fi
 	printf '\n   Recordatorios:\n'
@@ -1392,6 +1527,7 @@ all: $(PASOS)
 	printf '     * make down conserva volumenes, imagenes y secretos; make purge los borra.\n'
 	printf '     * Los recorridos interactivos no son parte del arranque:\n'
 	printf '         bash scripts/vault_mgmt/walkthrough.sh      (CRUD de secretos, pide TOTP)\n'
+	printf '         bash scripts/vault_mgmt/provisioning-walkthrough.sh  (alta y aprovisionamiento 4.6)\n'
 	printf '         bash scripts/postgres/verify-vault-mfa.sh   (login userpass + TOTP real)\n'
 
 # =============================================================================

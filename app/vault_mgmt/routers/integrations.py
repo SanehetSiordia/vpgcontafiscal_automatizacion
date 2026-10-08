@@ -96,6 +96,7 @@ async def resolve(
                 wrap_token=item.wrap_token,
                 ttl_seconds=item.ttl_seconds,
                 expires_at=item.expires_at,
+                mediated=item.mediated,
             )
             for item in result.deliveries
         ],

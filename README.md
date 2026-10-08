@@ -7,8 +7,9 @@ Automatizacion Inteligente para contabilidad fiscal VPG
 | [2. PostgreSQL 17](readme/etapa-2-postgresql.md) | listo | `postgres-service` |
 | [3. user-mgmt-service (FastAPI)](readme/etapa-3-user-mgmt-service.md) | listo | `user-mgmt-service` |
 | [4. vault-mgmt-service (CRUD de secretos)](readme/etapa-4-vault-mgmt-service.md) | listo | `vault-mgmt-service` |
+| [4.6 Aprovisionamiento de consumidores](readme/etapa-4-6-aprovisionamiento.md) | listo | `vault-mgmt-worker` |
 | 5. Frontend | **no implementado**: estas etapas terminan en el backend | — |
-| 6. Crawler | **no implementado**: la etapa 4 entrega su *contrato de consumo*, no el crawler | — |
+| 6. Crawler | **no implementado**: las etapas 4 y 4.6 entregan su *contrato de consumo*, no el crawler | — |
 
 Este archivo es el **índice**. La documentación de cada etapa vive en
 [`readme/`](readme/), un archivo por componente, para que cada uno se pueda leer
@@ -59,6 +60,21 @@ contrato de consumo del futuro crawler.
 - [Pruebas unitarias (etapa 4)](readme/etapa-4-vault-mgmt-service.md#pruebas-unitarias-etapa-4)
 - [Seguridad (etapa 4)](readme/etapa-4-vault-mgmt-service.md#seguridad-etapa-4)
 
+### [Etapa 4.6 · Aprovisionamiento de consumidores](readme/etapa-4-6-aprovisionamiento.md)
+
+El alta y el aprovisionamiento de una identidad de maquina **desde la API**, con
+operaciones persistentes que una futura plataforma React podra consultar, un
+`vault-mgmt-worker` que las procesa, y la credencial entregada a un **receptor
+configurado** por un canal interno (`claim` / `ack`) en vez de copiada a mano.
+
+- [El ciclo de una emision](readme/etapa-4-6-aprovisionamiento.md#el-ciclo-de-una-emisión)
+- [Contrato publico](readme/etapa-4-6-aprovisionamiento.md#contrato-público)
+- [Entrega al futuro crawler: claim y ack](readme/etapa-4-6-aprovisionamiento.md#entrega-al-futuro-crawler-claim-y-ack)
+- [Entrega mediada y consumidores heredados](readme/etapa-4-6-aprovisionamiento.md#entrega-mediada-y-consumidores-heredados)
+- [Arranque con `make all`](readme/etapa-4-6-aprovisionamiento.md#arranque-con-make-all)
+- [Comprobaciones reproducibles (etapa 4.6)](readme/etapa-4-6-aprovisionamiento.md#comprobaciones-reproducibles-etapa-46)
+- [Seguridad (etapa 4.6)](readme/etapa-4-6-aprovisionamiento.md#seguridad-etapa-46)
+
 ---
 
 ## Puesta en marcha, en orden
@@ -76,6 +92,14 @@ aquí solo está la secuencia y dónde buscarla.
 | 6 | Migración 003, credencial interna y políticas KV del catálogo | [etapa 4](readme/etapa-4-vault-mgmt-service.md#1-preparación-por-cli) |
 | 7 | `docker compose up -d` y comprobar salud de las dos APIs | [etapa 4](readme/etapa-4-vault-mgmt-service.md#3-arrancar) |
 | 8 | Recorrido interactivo de comprobación: `bash scripts/vault_mgmt/walkthrough.sh` | [etapa 4](readme/etapa-4-vault-mgmt-service.md#6--interactivo--recorrido-crud-completo) |
+| 9 | Alta y aprovisionamiento de un consumidor de máquina | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#comprobaciones-reproducibles-etapa-46) |
+
+> **Desde la etapa 4.6 hay un atajo para casi todo esto: `make all`.** Valida
+> herramientas, arranca, **inicializa Vault si el volumen es nuevo**, lo
+> desbloquea con `secrets/VAULT_UNSEAL_KEY`, aplica las migraciones que falten,
+> genera la credencial de cada receptor y levanta las dos APIs y el worker.
+> `make help` resume los objetivos. Lo que sigue siendo tuyo porque enrola un
+> TOTP: habilitar KV v2, `vpg-auth-bootstrap` y el alta del administrador.
 
 > **Tras cada reinicio de Vault hay que volver a desbloquearlo.** Es un paso
 > manual a propósito: ninguna de las dos APIs hace `unseal`. Mientras siga
@@ -98,6 +122,12 @@ aquí solo está la secuencia y dónde buscarla.
 | Mapeo rol de aplicación ↔ política de Vault | [etapa 4](readme/etapa-4-vault-mgmt-service.md#permisos-y-mapeo-rol--política-de-vault) |
 | Entrega de secretos y qué **no** es el response wrapping | [etapa 4](readme/etapa-4-vault-mgmt-service.md#entrega-de-secretos) |
 | Contrato del futuro crawler | [etapa 4](readme/etapa-4-vault-mgmt-service.md#contrato-del-futuro-crawler-una-máquina-independiente) |
+| Dar de alta y aprovisionar un consumidor desde la API | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#contrato-público) |
+| Cómo llega la credencial al receptor (`claim` / `ack`) | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#entrega-al-futuro-crawler-claim-y-ack) |
+| Por qué un consumidor heredado no está acotado por sus bindings | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#entrega-mediada-y-consumidores-heredados) |
+| Rotar o revocar una credencial de máquina | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#rotación-y-revocación) |
+| Qué hace `make all`, `make down` y `make purge` | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#arranque-con-make-all) |
+| Qué cambia (y qué no) con el auto-unseal de GCP | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#evolución-a-gcp-fuera-de-esta-etapa) |
 | Recorrer el CRUD de secretos de punta a punta | [etapa 4 · comprobación 6](readme/etapa-4-vault-mgmt-service.md#6--interactivo--recorrido-crud-completo) (`walkthrough.sh`) |
 | Un fallo parcial y cómo reconciliarlo | [etapa 4 · comprobación 9](readme/etapa-4-vault-mgmt-service.md#9-fallo-parcial-y-reconciliación) |
 | Importar secretos que ya existían en Vault | [etapa 4 · comprobación 10](readme/etapa-4-vault-mgmt-service.md#10-inventario-e-importación-de-secretos-anteriores) |
@@ -111,12 +141,12 @@ aquí solo está la secuencia y dónde buscarla.
 | Ruta | Qué contiene |
 |---|---|
 | `readme/` | La documentación por etapas que indexa este archivo |
-| `app/` | Las dos aplicaciones: `app/` (user-mgmt) y `app/vault_mgmt/`, con módulos compartidos en `app/core/` |
-| `sql/` | Migraciones numeradas: `001_employees.sql`, `002_vault_operations.sql`, `003_vault_mgmt.sql` |
+| `app/` | Las dos aplicaciones: `app/` (user-mgmt) y `app/vault_mgmt/`, con módulos compartidos en `app/core/`. El worker de la etapa 4.6 es `app/vault_mgmt/worker.py` |
+| `sql/` | Migraciones numeradas: `001_employees.sql`, `002_vault_operations.sql`, `003_vault_mgmt.sql`, `004_crawler_provisioning.sql` |
 | `scripts/` | Preparación por CLI, agrupada por componente (`postgres/`, `user_mgmt/`, `vault_mgmt/`) |
 | `config/` | `vault.hcl` y las políticas de Vault en `config/policies/` |
 | `requirements/` | Dependencias fijadas, un archivo por componente y por entorno |
-| `tests/` | `tests/` (etapa 3) y `tests/vault_mgmt/` (etapa 4) |
+| `tests/` | `tests/` (etapa 3) y `tests/vault_mgmt/` (etapas 4 y 4.6) |
 | `postman/` | Colecciones y environments, uno por API |
 | `secrets/` | Archivos de Compose secret. **Fuera de Git y del contexto de build** |
 
@@ -127,9 +157,12 @@ aquí solo está la secuencia y dónde buscarla.
 Están justificadas en cada archivo; aquí solo quedan enunciadas, porque
 condicionan cómo se opera el proyecto entero.
 
-1. **El desbloqueo de Vault es manual.** Ningún servicio hace `unseal`. Si una
-   dependencia falta, el proceso arranca igualmente y responde 503 en readiness
-   con el detalle: lo contrario dejaría sin diagnóstico el caso más común.
+1. **Ningún servicio hace `unseal`.** Si una dependencia falta, el proceso
+   arranca igualmente y responde 503 en readiness con el detalle: lo contrario
+   dejaría sin diagnóstico el caso más común. Desde la etapa 4.6 el desbloqueo
+   lo hace `make all` con `secrets/VAULT_UNSEAL_KEY`, que es una decisión
+   explícita de este entorno local: quien tenga ese archivo abre todos los
+   secretos. Sin él se vuelve al desbloqueo manual, y el Makefile lo dice.
 2. **Ninguna aplicación emite DDL.** No hay `create_all()` en ningún punto. El
    esquema lo crean migraciones SQL numeradas que se aplican con scripts
    explícitos, y la idempotencia no sustituye al versionado.

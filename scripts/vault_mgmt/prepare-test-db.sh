@@ -5,7 +5,7 @@
 #   bash scripts/vault_mgmt/prepare-test-db.sh [--recreate]
 #
 # Es la misma base que usa la suite de la etapa 3 (vpg_contadores_test), con la
-# migracion 003 anadida: las dos suites comparten PostgreSQL de pruebas y cada
+# migraciones 003 y 004 anadidas: las dos suites comparten PostgreSQL de pruebas y cada
 # una limpia sus propias tablas.
 #
 # Por que una base real y no SQLite: las pruebas comprueban restricciones que
@@ -53,6 +53,12 @@ echo "==> Aplicando 003_vault_mgmt.sql en ${TEST_DB}"
 docker compose exec -T postgres-service \
   psql -v ON_ERROR_STOP=1 -v app_user="$PG_APP" --no-psqlrc --quiet \
        -U "$PG_USER" -d "$TEST_DB" < "${REPO_ROOT}/sql/003_vault_mgmt.sql" \
+  | grep -viE 'already exists, skipping|does not exist, skipping' || true
+
+echo "==> Aplicando 004_crawler_provisioning.sql en ${TEST_DB}"
+docker compose exec -T postgres-service \
+  psql -v ON_ERROR_STOP=1 -v app_user="$PG_APP" --no-psqlrc --quiet \
+       -U "$PG_USER" -d "$TEST_DB" < "${REPO_ROOT}/sql/004_crawler_provisioning.sql" \
   | grep -viE 'already exists, skipping|does not exist, skipping' || true
 
 echo "==> Tablas de ${VM_SCHEMA} en ${TEST_DB}"

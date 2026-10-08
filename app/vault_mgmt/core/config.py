@@ -21,11 +21,18 @@ Lo que este servicio **no** tiene, a proposito:
 from __future__ import annotations
 
 import functools
+import re
 from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Mismos alfabetos que los CHECK de las migraciones 003 y 004: lo que no pase
+# por aqui tampoco entraria en PostgreSQL, y asi el error es 422 y no 500.
+_MOUNT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_ROLE_PREFIX_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,32}")
+_RECEIVER_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,62}")
 
 
 def _read_secret_file(path: str | None, *, label: str, required: bool) -> SecretStr | None:
@@ -139,6 +146,62 @@ class Settings(BaseSettings):
     rate_limit_session_per_minute: Annotated[int, Field(ge=1, le=10000)] = 120
     rate_limit_consumer_per_minute: Annotated[int, Field(ge=1, le=10000)] = 60
     rate_limit_global_per_minute: Annotated[int, Field(ge=1, le=100000)] = 600
+    rate_limit_receiver_per_minute: Annotated[int, Field(ge=1, le=10000)] = 60
+
+    # --- Aprovisionamiento de consumidores de maquina (etapa 4.6) -----------
+    #
+    # PERFIL LOCAL. El aprovisionador necesita un token administrativo de Vault
+    # para crear la AppRole del consumidor y emitir su SecretID. En este entorno
+    # se le monta en SOLO LECTURA el token inicial del proyecto.
+    #
+    # Esto es una simplificacion deliberada de desarrollo, no una configuracion
+    # de produccion: ese token puede hacer cualquier cosa en Vault, y lo que lo
+    # limita aqui es el CODIGO (approle_admin.py solo opera sobre el montaje y
+    # los roles gestionados), no la ACL. La sustitucion es una identidad tecnica
+    # propia con politica acotada, y por eso el proveedor esta separado en
+    # app/vault_mgmt/core/vault_auth.py: se cambia el proveedor sin tocar ningun
+    # endpoint. Si el archivo no esta montado, el aprovisionamiento queda
+    # desactivado y se dice en readiness; el resto del servicio sigue operando.
+    vault_token_file: str = "/run/secrets/vault_provisioner_token"
+    # Montaje AppRole de los consumidores GESTIONADOS por esta API. Es el mismo
+    # que usa el consumidor heredado de la etapa 4, pero cada consumidor tiene
+    # su propio rol dentro de el.
+    managed_approle_mount: str = "approle-crawler"
+    # Politica de los consumidores gestionados. NO incluye lectura del prefijo
+    # KV: su entrega es mediada (la lee el backend autorizado y la envuelve).
+    managed_policy_name: str = "vpg-crawler-managed"
+    managed_role_prefix: str = "vpg-managed-"
+    crawler_token_ttl_seconds: Annotated[int, Field(ge=60, le=86400)] = 1200
+    crawler_token_max_ttl_seconds: Annotated[int, Field(ge=60, le=604800)] = 3600
+    crawler_secret_id_ttl_seconds: Annotated[int, Field(ge=60, le=604800)] = 604800
+    # SecretID de un solo uso: el receptor lo canjea una vez por un token. Si se
+    # reinicia y lo pierde, hay que REAPROVISIONAR (no se reutiliza), y el token
+    # que obtuvo se renueva hasta su max_ttl. Esta documentado en la etapa 4.6.
+    crawler_secret_id_num_uses: Annotated[int, Field(ge=1, le=10)] = 1
+
+    # Receptores configurados: "<receptor>=<ruta del archivo>", separados por
+    # comas. Texto plano y no JSON a proposito, para que se lea igual de bien en
+    # .env, en compose.yaml y en un 'docker inspect'.
+    #
+    # El receptor no se identifica por consumer_id (que no es una contrasena)
+    # sino por su credencial, que el servidor asocia al consumidor autorizado.
+    receivers: str = "local=/run/secrets/crawler_receiver_local"
+    receiver_credential_header: str = "X-VPG-Receiver-Credential"
+    # TTL de la envoltura de APROVISIONAMIENTO (lleva el SecretID). Mas larga
+    # que la de una entrega de datos porque el receptor puede estar arrancando.
+    provisioning_wrap_ttl_seconds: Annotated[int, Field(ge=30, le=600)] = 120
+    # Reintentos de claim sobre una misma entrega antes de darla por fallida.
+    provisioning_max_claims: Annotated[int, Field(ge=1, le=50)] = 5
+
+    # --- Worker de operaciones ----------------------------------------------
+    worker_poll_seconds: Annotated[float, Field(gt=0, le=60)] = 2.0
+    # Arrendamiento de una operacion. Caduca solo: un worker muerto no deja la
+    # cola bloqueada para siempre.
+    worker_lease_seconds: Annotated[int, Field(ge=10, le=600)] = 60
+    worker_batch: Annotated[int, Field(ge=1, le=50)] = 5
+    worker_max_attempts: Annotated[int, Field(ge=1, le=20)] = 3
+    # Nombre del worker en el lease. Se rellena solo si no se declara.
+    worker_name: str = ""
 
     # --- CORS ---------------------------------------------------------------
     # Lista explicita. Nunca '*' con credenciales: el navegador lo rechaza y,
@@ -182,6 +245,56 @@ class Settings(BaseSettings):
             raise ValueError("VAULT_MGMT_KV_PREFIX no puede estar vacio ni contener '..'")
         return cleaned
 
+    @field_validator("managed_approle_mount")
+    @classmethod
+    def _check_approle_mount(cls, value: str) -> str:
+        cleaned = value.strip().strip("/")
+        if not _MOUNT_RE.fullmatch(cleaned):
+            raise ValueError(
+                "VAULT_MGMT_MANAGED_APPROLE_MOUNT es el nombre del montaje "
+                "AppRole, sin barras (letras minusculas, digitos, '_' y '-')"
+            )
+        return cleaned
+
+    @field_validator("managed_role_prefix")
+    @classmethod
+    def _check_role_prefix(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned or not _ROLE_PREFIX_RE.fullmatch(cleaned):
+            raise ValueError(
+                "VAULT_MGMT_MANAGED_ROLE_PREFIX debe empezar por letra o digito "
+                "en minuscula y contener solo [a-z0-9._-]"
+            )
+        return cleaned
+
+    @field_validator("receivers")
+    @classmethod
+    def _check_receivers(cls, value: str) -> str:
+        seen: set[str] = set()
+        for entry in value.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            key, sep, path = entry.partition("=")
+            if not sep or not key.strip() or not path.strip():
+                raise ValueError(
+                    "cada receptor se declara como '<receptor>=<ruta del archivo>' "
+                    f"y se separan por comas; '{entry}' no lo cumple"
+                )
+            name = key.strip()
+            if not _RECEIVER_RE.fullmatch(name):
+                raise ValueError(
+                    f"'{name}' no es un nombre de receptor valido "
+                    "(minusculas, digitos, '.', '_' y '-')"
+                )
+            if name in seen:
+                raise ValueError(
+                    f"el receptor '{name}' esta declarado dos veces: una "
+                    "credencial por receptor, y una sola"
+                )
+            seen.add(name)
+        return value
+
     @field_validator("cors_allow_origins")
     @classmethod
     def _check_cors(cls, value: list[str]) -> list[str]:
@@ -197,6 +310,11 @@ class Settings(BaseSettings):
         if self.max_page_limit < self.default_page_limit:
             raise ValueError(
                 "VAULT_MGMT_MAX_PAGE_LIMIT no puede ser menor que el limite por defecto"
+            )
+        if self.crawler_token_max_ttl_seconds < self.crawler_token_ttl_seconds:
+            raise ValueError(
+                "VAULT_MGMT_CRAWLER_TOKEN_MAX_TTL_SECONDS no puede ser menor que "
+                "el TTL inicial: Vault rechazaria el rol"
             )
         return self
 
@@ -223,6 +341,67 @@ class Settings(BaseSettings):
     @property
     def has_internal_credential(self) -> bool:
         return self.internal_credential is not None
+
+    # --- Etapa 4.6: token del aprovisionador y credenciales de receptor -----
+
+    @property
+    def receiver_entries(self) -> tuple[tuple[str, str], ...]:
+        """Pares (receptor, ruta) ya separados del texto de configuracion."""
+        pares: list[tuple[str, str]] = []
+        for entry in self.receivers.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            name, _sep, path = entry.partition("=")
+            pares.append((name.strip(), path.strip()))
+        return tuple(pares)
+
+    @functools.cached_property
+    def receiver_credentials(self) -> dict[str, SecretStr]:
+        """Credencial interna de cada receptor configurado.
+
+        Un receptor sin archivo legible NO se registra: mejor que no pueda
+        reclamar nada a que lo haga con una credencial vacia. Se avisa en el
+        log del arranque, no aqui, porque leer configuracion no debe escribir.
+        """
+        resolved: dict[str, SecretStr] = {}
+        for name, path in self.receiver_entries:
+            secret = _read_secret_file(
+                path, label=f"receptor '{name}'", required=False
+            )
+            if secret is not None:
+                resolved[name] = secret
+        return resolved
+
+    @property
+    def configured_receivers(self) -> tuple[str, ...]:
+        """Receptores DECLARADOS, tengan o no su archivo presente."""
+        return tuple(name for name, _path in self.receiver_entries)
+
+    @functools.cached_property
+    def vault_provisioner_token(self) -> SecretStr | None:
+        """Token administrativo de Vault del PERFIL LOCAL, por archivo.
+
+        Puede faltar: entonces el aprovisionamiento queda desactivado, el resto
+        del servicio sigue operando y ``/health/ready`` lo refleja. No se
+        inventa un valor por defecto y no se lee de ninguna variable de entorno.
+        """
+        return _read_secret_file(
+            self.vault_token_file, label="token del aprovisionador", required=False
+        )
+
+    @property
+    def provisioning_enabled(self) -> bool:
+        """Hay con que aprovisionar: token del proveedor y algun receptor."""
+        return self.vault_provisioner_token is not None
+
+    def managed_role_name(self, consumer_name: str) -> str:
+        """Rol AppRole de un consumidor gestionado, derivado de su nombre.
+
+        Derivado y no elegido por el cliente: asi una peticion no puede apuntar
+        a un rol ajeno ni salirse del montaje gestionado.
+        """
+        return f"{self.managed_role_prefix}{consumer_name}"
 
     @property
     def database_url(self) -> str:

@@ -19,7 +19,7 @@ import datetime as dt
 import uuid
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Text, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PgUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -164,6 +164,36 @@ class SecretConsumer(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # --- etapa 4.6: aprovisionamiento automatico (migracion 004) ------------
+    # direct: consumidor HEREDADO de la etapa 4, preparado por CLI. Su token lee
+    #   el prefijo KV por si mismo.
+    # mediated: consumidor de la etapa 4.6. Su politica NO cubre la lectura de
+    #   KV: el backend autorizado lee la version permitida y se la envuelve.
+    delivery_mode: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="direct"
+    )
+    provisioning_state: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="unprovisioned"
+    )
+    # Accessors, no credenciales: identifican para revocar, no permiten usar.
+    secret_id_accessor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Credencial anterior durante una rotacion after_ack. Se destruye cuando el
+    # receptor confirma la nueva, no antes.
+    previous_secret_id_accessor: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    last_token_accessor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_operation_id: Mapped[uuid.UUID | None] = mapped_column(
+        PgUUID(as_uuid=True), nullable=True
+    )
+    provisioned_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    @property
+    def is_mediated(self) -> bool:
+        return self.delivery_mode == "mediated"
+
 
 class SecretConsumerBinding(Base):
     __tablename__ = "secret_consumer_bindings"
@@ -222,6 +252,98 @@ class SecretOperation(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # --- etapa 4.6 (migracion 004) -----------------------------------------
+    consumer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.secret_consumers.consumer_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Huella de los parametros NO sensibles de la solicitud. Permite distinguir
+    # "misma clave, misma peticion" de "misma clave, otra peticion" -> 409.
+    request_fingerprint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Arrendamiento del worker. Caduca solo: un worker muerto no bloquea la cola.
+    lease_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
+    leased_until: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+
+class SecretReceiver(Base):
+    """Quien puede reclamar la emision de un consumidor.
+
+    ``credential_ref`` es el NOMBRE del archivo de secreto, no su contenido. Esa
+    referencia es lo que asocia, en el servidor, una credencial concreta con un
+    consumidor autorizado; el ``consumer_id`` no sirve para eso porque no es una
+    contrasena y aparece en respuestas de inventario.
+    """
+
+    __tablename__ = "secret_receivers"
+    __table_args__ = {"schema": SCHEMA}
+
+    receiver_id: Mapped[uuid.UUID] = _pk_uuid()
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    consumer_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.secret_consumers.consumer_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    credential_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[uuid.UUID | None] = _actor_column()
+    created_at: Mapped[dt.datetime] = _created_at()
+    updated_at: Mapped[dt.datetime] = _updated_at()
+    last_claim_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class ProvisioningDelivery(Base):
+    """Una emision concreta hacia un receptor.
+
+    No guarda el SecretID, ni el wrapping token, ni el token de Vault: solo sus
+    ACCESSORS, que sirven para revocar y auditar pero no para autenticarse.
+    """
+
+    __tablename__ = "secret_provisioning_deliveries"
+    __table_args__ = {"schema": SCHEMA}
+
+    delivery_id: Mapped[uuid.UUID] = _pk_uuid()
+    operation_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.secret_operations.operation_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    consumer_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.secret_consumers.consumer_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    receiver_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.secret_receivers.receiver_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="reserved")
+    secret_id_accessor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    wrap_accessor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_accessor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    wrap_ttl_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    claimed_at: Mapped[dt.datetime] = _created_at()
+    # Caducidad de la ENVOLTURA. Pasada sin ack, el SecretID sigue vivo en Vault
+    # y hay que destruirlo por su accessor: eso es reconciliar.
+    expires_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    acked_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = _created_at()
+    updated_at: Mapped[dt.datetime] = _updated_at()
+
 
 class SecretAudit(Base):
     __tablename__ = "secret_audit"
@@ -247,15 +369,49 @@ class SecretAudit(Base):
 COLLECTION_STATES = ("active", "archived", "purged")
 RECORD_STATES = ("active", "soft_deleted", "destroyed")
 CONSUMER_STATES = ("active", "revoked")
+PROVISIONING_STATES = (
+    "unprovisioned",
+    "provisioning",
+    "ready",
+    "failed",
+    "revoked",
+)
+DELIVERY_MODES = ("direct", "mediated")
+RECEIVER_STATES = ("active", "disabled")
+DELIVERY_STATES = (
+    "reserved",
+    "delivered",
+    "acked",
+    "expired",
+    "failed",
+    "superseded",
+)
+# Una entrega "viva" es la que todavia puede acabar en manos del receptor. El
+# indice parcial secret_provisioning_deliveries_one_live_ux usa estas dos.
+LIVE_DELIVERY_STATES = frozenset({"reserved", "delivered"})
+
 OPERATION_STATUSES = (
     "pending",
     "in_progress",
+    "waiting_receiver",
+    "awaiting_ack",
     "completed",
     "failed",
     "needs_reconciliation",
 )
-ACTIVE_OPERATION_STATUSES = frozenset({"pending", "in_progress"})
+# Estados vivos. 'waiting_receiver' y 'awaiting_ack' son de la etapa 4.6: la
+# solicitud esta guardada y la operacion sigue abierta, pero el trabajo no
+# depende de este proceso sino de que aparezca el receptor.
+ACTIVE_OPERATION_STATUSES = frozenset(
+    {"pending", "in_progress", "waiting_receiver", "awaiting_ack"}
+)
+# Lo que el worker puede tomar de la cola. 'awaiting_ack' NO esta: ahi se espera
+# al receptor, no hay trabajo que hacer.
+CLAIMABLE_OPERATION_STATUSES = frozenset({"pending", "in_progress"})
 TERMINAL_OPERATION_STATUSES = frozenset({"completed", "failed", "needs_reconciliation"})
+CONSUMER_OPERATION_TYPES = frozenset(
+    {"consumer_register", "consumer_provision", "consumer_rotate", "consumer_revoke"}
+)
 OPERATION_TYPES = (
     "collection_create",
     "collection_update",
@@ -273,6 +429,10 @@ OPERATION_TYPES = (
     "record_purge",
     "consumer_bindings_update",
     "inventory_import",
+    "consumer_register",
+    "consumer_provision",
+    "consumer_rotate",
+    "consumer_revoke",
 )
 READER_ROLE_CODES = ("admin", "manager", "employee")
 
@@ -281,18 +441,27 @@ __all__ = [
     "SCHEMA",
     "EMPLOYEES_SCHEMA",
     "COLLECTION_SCOPE_SENTINEL",
+    "ProvisioningDelivery",
     "SecretAudit",
     "SecretCollection",
     "SecretCollectionSchema",
     "SecretConsumer",
+    "SecretReceiver",
     "SecretConsumerBinding",
     "SecretOperation",
     "SecretRecord",
     "ACTIVE_OPERATION_STATUSES",
+    "CLAIMABLE_OPERATION_STATUSES",
     "COLLECTION_STATES",
+    "CONSUMER_OPERATION_TYPES",
     "CONSUMER_STATES",
+    "DELIVERY_MODES",
+    "DELIVERY_STATES",
+    "LIVE_DELIVERY_STATES",
     "OPERATION_STATUSES",
     "OPERATION_TYPES",
+    "PROVISIONING_STATES",
+    "RECEIVER_STATES",
     "READER_ROLE_CODES",
     "RECORD_STATES",
     "TERMINAL_OPERATION_STATUSES",

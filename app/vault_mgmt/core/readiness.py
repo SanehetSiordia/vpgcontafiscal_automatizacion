@@ -45,6 +45,10 @@ REQUIRED_TABLES = (
     "secret_consumer_bindings",
     "secret_operations",
     "secret_audit",
+    # Migracion 004 (etapa 4.6). Si faltan, el catalogo no esta completo: una
+    # entrega no tendria donde registrarse y el claim fallaria a mitad.
+    "secret_receivers",
+    "secret_provisioning_deliveries",
 )
 
 
@@ -56,6 +60,13 @@ class ReadinessReport:
     vault_unsealed: bool = False
     user_mgmt_ready: bool = False
     gateway_authenticated: bool = False
+    # --- etapa 4.6: informativas, NO condicionan `ready` -------------------
+    # El aprovisionamiento es una capacidad anadida, no un requisito para
+    # atender el CRUD de secretos. Si falta su token o no hay receptores, las
+    # solicitudes se quedan guardadas en 'pending' y se dice aqui; tumbar todo
+    # el servicio por eso dejaria sin servicio lo que si funciona.
+    provisioning_enabled: bool = False
+    receivers_configured: bool = False
     detail: str | None = None
     checked_at: dt.datetime | None = None
 
@@ -80,6 +91,11 @@ class ReadinessReport:
                 "vault_unsealed": self.vault_unsealed,
                 "user_mgmt_ready": self.user_mgmt_ready,
                 "internal_gateway_authenticated": self.gateway_authenticated,
+            },
+            # Separadas de `checks` para que quede explicito que no bloquean.
+            "capabilities": {
+                "consumer_provisioning": self.provisioning_enabled,
+                "receivers_configured": self.receivers_configured,
             },
             "detail": self.detail,
             "checked_at": self.checked_at.isoformat() if self.checked_at else None,
@@ -153,6 +169,21 @@ class ReadinessState:
         report.gateway_authenticated = authenticated
         if problem:
             details.append(f"pasarela: {problem}")
+
+        # 5. Capacidades de la etapa 4.6. No condicionan `ready`: se informan.
+        report.provisioning_enabled = self._settings.provisioning_enabled
+        report.receivers_configured = bool(self._settings.receiver_credentials)
+        if not report.provisioning_enabled:
+            details.append(
+                "aprovisionamiento desactivado: falta el token del aprovisionador "
+                f"({self._settings.vault_token_file}). Las altas de consumidores "
+                "se guardan y quedan en 'pending'"
+            )
+        elif not report.receivers_configured:
+            details.append(
+                "aprovisionamiento sin receptores con credencial: nadie puede "
+                "reclamar una emision (VAULT_MGMT_RECEIVERS)"
+            )
 
         report.detail = "; ".join(details) if details else None
         self._report = report

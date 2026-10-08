@@ -39,20 +39,26 @@ from app.core.logging import REQUEST_ID_HEADER, configure_logging, get_logger, v
 from app.core.rate_limit import SlidingWindowLimiter
 from app.core.vault import VaultError, VaultSealed, VaultUnavailable
 from app.core.vault_kv import KvV2Client
+from app.vault_mgmt.core.approle_admin import AppRoleAdminClient
 from app.vault_mgmt.core.config import get_settings
 from app.vault_mgmt.core.database import dispose_engine, get_session_factory, init_engine
 from app.vault_mgmt.core.gateway_client import GatewayClient
 from app.vault_mgmt.core.machine_auth import MachineAuthError, VaultProbe
 from app.vault_mgmt.core.readiness import ReadinessState
+from app.vault_mgmt.core.receiver_auth import ReceiverRegistry
+from app.vault_mgmt.core.vault_auth import ProvisioningUnavailable, build_token_provider
 from app.vault_mgmt.routers import admin as admin_router
 from app.vault_mgmt.routers import collections as collections_router
+from app.vault_mgmt.routers import consumers as consumers_router
 from app.vault_mgmt.routers import health as health_router
 from app.vault_mgmt.routers import integrations as integrations_router
+from app.vault_mgmt.routers import provisioning_internal as provisioning_router
 from app.vault_mgmt.routers import records as records_router
 from app.vault_mgmt.services.access import AccessService
 from app.vault_mgmt.services.catalog import CatalogService
 from app.vault_mgmt.services.consumers import ConsumerService
 from app.vault_mgmt.services.lifecycle import LifecycleService
+from app.vault_mgmt.services.provisioning import ProvisioningService
 from app.vault_mgmt.services.records import RecordService
 
 logger = get_logger("app.vault_mgmt.main")
@@ -145,11 +151,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.access_service = AccessService(
         settings=settings, session_factory=session_factory, gateway=gateway
     )
+    # --- Etapa 4.6: aprovisionamiento de consumidores de maquina ------------
+    # El proveedor del token esta separado para poder sustituir el token local
+    # por una identidad tecnica sin tocar endpoints (ver core/vault_auth.py).
+    token_provider = build_token_provider(settings)
+    approle = AppRoleAdminClient(settings, token_provider)
+    receivers = ReceiverRegistry(settings)
+    app.state.token_provider = token_provider
+    app.state.approle = approle
+    app.state.receivers = receivers
+    app.state.provisioning_service = ProvisioningService(
+        settings=settings, session_factory=session_factory, approle=approle
+    )
     app.state.consumer_service = ConsumerService(
         settings=settings,
         session_factory=session_factory,
         probe=probe,
         kv_factory=kv_factory,
+        token_provider=token_provider,
     )
 
     report = await readiness.refresh(session_factory, probe, gateway)
@@ -185,6 +204,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         with contextlib.suppress(asyncio.CancelledError):
             await task
         await app.state.consumer_service.aclose()
+        await approle.aclose()
+        await token_provider.aclose()
         await gateway.aclose()
         await probe.aclose()
         await dispose_engine()
@@ -211,6 +232,14 @@ def create_app() -> FastAPI:
             {
                 "name": "admin",
                 "description": "Capacidad efectiva, operaciones, auditoria y consumidores.",
+            },
+            {
+                "name": "consumers",
+                "description": (
+                    "Consumidores de maquina: alta, aprovisionamiento, alcance, "
+                    "rotacion y revocacion. Solo admin. Ninguna respuesta lleva "
+                    "credenciales."
+                ),
             },
             {
                 "name": "integrations",
@@ -316,6 +345,20 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(VaultError)
     async def handle_vault_error(request: Request, exc: VaultError) -> JSONResponse:
+        if isinstance(exc, ProvisioningUnavailable):
+            # Falta una dependencia del aprovisionamiento (su token). Es 503,
+            # no 502: no es Vault el que falla, es que no hay con que llamarlo.
+            mapped = AppError(
+                exc.message, status_code=503, code="provisioning_unavailable"
+            )
+            logger.warning(
+                "aprovisionamiento no disponible",
+                extra={
+                    "request_id": getattr(request.state, "request_id", ""),
+                    "route": request.url.path,
+                },
+            )
+            return _error_response(request, mapped)
         if isinstance(exc, (VaultSealed, VaultUnavailable)):
             mapped = AppError(
                 f"Vault no esta disponible: {exc.message}",
@@ -390,7 +433,12 @@ def create_app() -> FastAPI:
     app.include_router(collections_router.router, prefix=prefix)
     app.include_router(records_router.router, prefix=prefix)
     app.include_router(admin_router.router, prefix=prefix)
+    app.include_router(consumers_router.router, prefix=prefix)
     app.include_router(integrations_router.router, prefix=prefix)
+    # Canal interno de aprovisionamiento: fuera del OpenAPI publico y con su
+    # propia credencial por receptor. Comparte puerto, asi que lo que lo
+    # protege es la credencial, no estar oculto en Swagger.
+    app.include_router(provisioning_router.router)
     return app
 
 

@@ -40,6 +40,10 @@ class ReadyOut(BaseModel):
                     "user_mgmt_ready": False,
                     "internal_gateway_authenticated": True,
                 },
+                "capabilities": {
+                    "consumer_provisioning": True,
+                    "receivers_configured": True,
+                },
                 "detail": "vault: sellado ('vault operator unseal', paso manual)",
                 "checked_at": "2026-10-05T10:00:00+00:00",
             }
@@ -47,7 +51,20 @@ class ReadyOut(BaseModel):
     )
 
     ready: bool
-    checks: dict[str, bool]
+    checks: dict[str, bool] = Field(
+        description="Lo que CONDICIONA `ready`. Si algo es false, 503."
+    )
+    # Separadas de `checks` para que quede explicito que NO bloquean: el
+    # aprovisionamiento de consumidores (etapa 4.6) es una capacidad anadida, no
+    # un requisito para atender el CRUD de secretos. Sin ella, una solicitud se
+    # guarda y queda en 'pending' en vez de perderse.
+    capabilities: dict[str, bool] = Field(
+        default_factory=dict,
+        description=(
+            "Capacidades opcionales. NO condicionan `ready`: si falta alguna, el "
+            "servicio sigue atendiendo lo demas y lo dice en `detail`."
+        ),
+    )
     detail: str | None
     checked_at: str | None
 

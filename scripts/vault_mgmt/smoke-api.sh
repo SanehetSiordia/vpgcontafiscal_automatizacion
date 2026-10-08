@@ -6,7 +6,8 @@
 #
 # Que comprueba, sin pedir ninguna credencial:
 #   1. Salud: live responde aunque Vault este sellado; ready dice que falta.
-#   2. Documentacion: Swagger, ReDoc y OpenAPI, con las 29 rutas del contrato.
+#   2. Documentacion: Swagger, ReDoc y OpenAPI, con las rutas del contrato
+#      (25 rutas y 35 operaciones desde la etapa 4.6).
 #   3. Que la pasarela interna NO esta en el OpenAPI publico.
 #   4. Que la pasarela interna exige SUS DOS credenciales, probandola desde
 #      otro contenedor de la red (que es de donde vendria un atacante interno).
@@ -70,12 +71,22 @@ for ruta in /docs /redoc /openapi.json; do
   fi
 done
 
-rutas=$(curl -s "${VM_BASE}/openapi.json" \
-  | python -c 'import json,sys; print(len(json.load(sys.stdin)["paths"]))' 2>/dev/null || echo 0)
-if [[ "$rutas" -ge 20 ]]; then
-  ok "el OpenAPI publica ${rutas} rutas"
+# Se cuentan DOS cosas, porque son dos numeros distintos y confundirlos ya dejo
+# este smoke desfasado una vez: PATHS son rutas unicas y OPERACIONES son pares
+# metodo+ruta (una misma ruta con GET y PUT son dos operaciones).
+conteo=$(curl -s "${VM_BASE}/openapi.json" | python -c '
+import json, sys
+spec = json.load(sys.stdin)["paths"]
+print(len(spec), sum(len(ops) for ops in spec.values()))' 2>/dev/null || echo "0 0")
+rutas=${conteo%% *}
+operaciones=${conteo##* }
+# Cota inferior y no un numero exacto: anadir un endpoint no deberia romper el
+# smoke, y quedarse corto si deberia. En la etapa 4.6 son 25 rutas y 35
+# operaciones (las de consumidores incluidas).
+if [[ "$rutas" -ge 25 && "$operaciones" -ge 35 ]]; then
+  ok "el OpenAPI publica ${rutas} rutas y ${operaciones} operaciones"
 else
-  fail "el OpenAPI solo publica ${rutas} rutas"
+  fail "el OpenAPI solo publica ${rutas} rutas y ${operaciones} operaciones (se esperaban 25 y 35)"
 fi
 
 esquemas=$(curl -s "${VM_BASE}/openapi.json" | python -c \
@@ -222,6 +233,33 @@ case "$maquina" in
 esac
 
 echo
+
+echo
+echo "==> 8. Canal interno de aprovisionamiento (etapa 4.6)"
+# No se reclama ninguna emision: solo se comprueba que el canal EXIGE la
+# credencial del receptor. Reclamar emitiria una credencial de verdad, y un
+# smoke no debe tener ese efecto.
+PROV_URL="${VM_BASE}/internal/v1/crawler/provisioning/claim"
+sin_cred=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$PROV_URL" -H 'Content-Type: application/json' --data-binary '{}')
+if [[ "$sin_cred" == "401" ]]; then
+  ok "claim sin credencial de receptor: 401"
+else
+  fail "claim sin credencial responde ${sin_cred}, se esperaba 401"
+fi
+mala=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$PROV_URL" -H 'Content-Type: application/json' -H 'X-VPG-Receiver-Credential: credencial-que-no-es-de-nadie' --data-binary '{}')
+if [[ "$mala" == "401" ]]; then
+  ok "claim con credencial invalida: 401"
+else
+  fail "claim con credencial invalida responde ${mala}, se esperaba 401"
+fi
+# El worker no atiende HTTP: se comprueba que su contenedor esta en marcha.
+worker=$(docker compose ps --format '{{.Service}} {{.State}}' 2>/dev/null | sed -n 's/^vault-mgmt-worker //p' | head -n 1 | tr -d '
+')
+if [[ "$worker" == "running" ]]; then
+  ok "vault-mgmt-worker en marcha (procesa la cola en PostgreSQL)"
+else
+  fail "vault-mgmt-worker no esta running (estado: ${worker:-desconocido})"
+fi
 if [[ "$fallos" -eq 0 ]]; then
   echo "==> Todas las comprobaciones no interactivas pasan."
 else
@@ -230,6 +268,10 @@ fi
 echo
 echo "    Lo que ESTA comprobacion no cubre, por diseno:"
 echo "      * el recorrido CRUD completo necesita un codigo TOTP de una persona;"
-echo "      * el consumo del crawler necesita role_id y secret_id reales."
-echo "    Los dos recorridos estan en el README (etapa 4) y en Postman."
+echo "      * el alta y el aprovisionamiento de un consumidor tambien (rol admin);"
+echo "      * el consumo de un consumidor heredado necesita role_id y secret_id reales."
+echo "    Los recorridos interactivos:"
+echo "      bash scripts/vault_mgmt/walkthrough.sh               CRUD de secretos"
+echo "      bash scripts/vault_mgmt/provisioning-walkthrough.sh  aprovisionamiento 4.6"
+echo "    Y en Postman, las dos colecciones."
 exit $(( fallos > 0 ? 1 : 0 ))

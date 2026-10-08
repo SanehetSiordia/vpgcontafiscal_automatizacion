@@ -188,6 +188,15 @@ class CrawlerDeliveryOut(BaseModel):
     wrap_token: str
     ttl_seconds: int
     expires_at: dt.datetime
+    mediated: bool = Field(
+        default=False,
+        description=(
+            "True: la leyo el backend autorizado por cuenta del consumidor "
+            "(consumidor gestionado, cuya politica NO cubre la lectura de KV). "
+            "False: la leyo el token del propio consumidor (consumidor heredado "
+            "de la etapa 4), cuya politica cubre todo el prefijo gestionado."
+        ),
+    )
 
 
 class CrawlerResolveOut(BaseModel):

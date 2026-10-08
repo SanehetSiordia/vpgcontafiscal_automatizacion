@@ -26,6 +26,11 @@ Lo que la coleccion NUNCA guarda, y por que
 * **Pruebas de MFA.** Igual: la prueba se guarda en una variable marcada como
   secreta y con valor vacio en la exportacion.
 * **Codigos TOTP.** No se reutilizan: cada paso que necesita uno pide uno nuevo.
+* **La credencial del receptor.** El canal interno de aprovisionamiento
+  (``claim`` / ``ack``) no se ejerce desde Postman con una persona delante:
+  lo usa un receptor con su propia credencial, leida de ``secrets/``. Su
+  contrato se entrega en una coleccion SEPARADA
+  (``vpg-crawler-internal``), con las credenciales vacias.
 """
 
 from __future__ import annotations
@@ -1350,6 +1355,10 @@ ENVIRONMENT_VALUES: list[tuple[str, str, str]] = [
     ("operation_id", "", "default"),
     # Contrato de maquina.
     ("consumer_id", "", "default"),
+    ("consumer_name", "", "default"),
+    # Receptor configurado del canal interno. Su CREDENCIAL no vive aqui:
+    # la usa el receptor desde secrets/, no una persona desde Postman.
+    ("receiver_name", "local", "default"),
     ("crawler_approle_mount", "approle-crawler", "default"),
     ("crawler_role_id", "", "secret"),
     ("crawler_secret_id", "", "secret"),
@@ -1373,6 +1382,213 @@ def build_environment() -> dict[str, Any]:
                 "enabled": True,
             }
             for key, value, kind in ENVIRONMENT_VALUES
+        ],
+    }
+
+
+def consumers_group() -> dict[str, Any]:
+    """Grupo 08: alta y aprovisionamiento de consumidores (etapa 4.6).
+
+    Todas las peticiones son del lado HUMANO y exigen rol admin. El canal
+    interno (``claim`` / ``ack``) NO esta aqui, y eso es deliberado: lo usa un
+    receptor con su propia credencial, no una persona desde Postman. Su contrato
+    se entrega aparte, en postman/vpg-crawler-internal.postman_collection.json,
+    con las credenciales vacias.
+    """
+    return {
+        "name": "08 - Consumidores de maquina (etapa 4.6)",
+        "description": (
+            "Alta, aprovisionamiento, alcance, rotacion y revocacion de una "
+            "identidad de maquina.\n\n"
+            "**Las mutaciones devuelven 202**, no 201: la solicitud se guarda y la "
+            "procesa el worker. `pending` significa *solicitud guardada*, no "
+            "entrega completada.\n\n"
+            "**Ninguna respuesta de este grupo lleva credenciales.** No hay "
+            "`role_id`, ni `secret_id`, ni tokens, ni wrapping tokens. Lo unico "
+            "que se devuelve de Vault son *accessors*, que sirven para revocar y "
+            "auditar pero no para autenticarse."
+        ),
+        "item": [
+            request(
+                "POST /vault/consumers - alta (202)",
+                "POST",
+                "base_url_vault_mgmt",
+                "/vault/consumers",
+                description=(
+                    "Registra el consumidor, su receptor y sus asignaciones "
+                    "iniciales.\n\n"
+                    "El cuerpo **no acepta** HCL, rutas de Vault, montaje, rol, root "
+                    "token ni URL del receptor: el montaje sale de la configuracion y "
+                    "el rol se deriva del nombre. Un campo de mas es 422.\n\n"
+                    "`receiver` debe ser un receptor **ya configurado** en el "
+                    "servicio; su credencial la genera `make all` en `secrets/`."
+                ),
+                headers=[{"key": "Idempotency-Key", "value": "{{$guid}}"}],
+                body={
+                    "name": "crawler-postman-{{$timestamp}}",
+                    "description": "consumidor de prueba creado desde Postman",
+                    "receiver": "{{receiver_name}}",
+                    "bindings": [],
+                },
+                tests=[
+                    "pm.test('Responde 202 (solicitud guardada)', () => pm.response.to.have.status(202));",
+                    "const b = pm.response.json();",
+                    "pm.test('Exactamente tres campos', function () {",
+                    "    pm.expect(Object.keys(b).sort()).to.eql(['consumer_id','operation_id','status']);",
+                    "});",
+                    "pm.test('pending no es entregado', () => pm.expect(b.status).to.eql('pending'));",
+                    "pm.test('Location para el polling', function () {",
+                    "    pm.expect(pm.response.headers.get('Location')).to.include(b.operation_id);",
+                    "});",
+                    "pm.test('Sin credenciales', function () {",
+                    "    const t = pm.response.text();",
+                    "    ['role_id','secret_id','wrap_token','vault_token'].forEach(function (k) {",
+                    "        pm.expect(t).to.not.include('\"' + k + '\"');",
+                    "    });",
+                    "});",
+                    "pm.environment.set('consumer_id', b.consumer_id);",
+                    "pm.environment.set('operation_id', b.operation_id);",
+                ],
+            ),
+            request(
+                "GET /vault/consumers - listado sin credenciales",
+                "GET",
+                "base_url_vault_mgmt",
+                "/vault/consumers",
+                description=(
+                    "Orden estable `created_at DESC, consumer_id`.\n\n"
+                    "`delivery_mode` distingue dos cosas que no son equivalentes: "
+                    "`direct` es un consumidor **heredado** de la etapa 4, cuyo token "
+                    "lee el prefijo KV por si mismo (sus bindings acotan lo que esta "
+                    "API le entrega, no lo que puede leer); `mediated` es de la etapa "
+                    "4.6 y su politica no cubre la lectura de KV."
+                ),
+                query=[
+                    {"key": "limit", "value": "{{page_limit}}"},
+                    {"key": "offset", "value": "0"},
+                ],
+                tests=[
+                    "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                    "const b = pm.response.json();",
+                    "pm.test('Pagina coherente', () => pm.expect(b.items.length).to.be.at.most(b.page.limit));",
+                    "pm.test('Sin credenciales', function () {",
+                    "    b.items.forEach(function (i) {",
+                    "        pm.expect(i).to.not.have.property('role_id');",
+                    "        pm.expect(i).to.not.have.property('secret_id');",
+                    "    });",
+                    "});",
+                    "pm.test('Avisa de los heredados', () => pm.expect(b.legacy_note).to.include('direct'));",
+                ],
+            ),
+            request(
+                "GET /vault/consumers/{id} - estado y ultima operacion",
+                "GET",
+                "base_url_vault_mgmt",
+                "/vault/consumers/{{consumer_id}}",
+                description=(
+                    "`provisioning_state`: `unprovisioned` (solo en el catalogo), "
+                    "`provisioning` (preparando su identidad), `ready` (el receptor "
+                    "acredito un token valido), `failed` o `revoked`.\n\n"
+                    "`ready` **no** garantiza que el token siga vivo: caduca por su "
+                    "TTL, y el SecretID por el suyo.\n\n"
+                    "`last_delivery` lleva solo *accessors*."
+                ),
+                tests=[
+                    "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                    "const b = pm.response.json();",
+                    "pm.test('Estado de aprovisionamiento conocido', function () {",
+                    "    pm.expect(['unprovisioned','provisioning','ready','failed','revoked'])",
+                    "        .to.include(b.consumer.provisioning_state);",
+                    "});",
+                    "pm.test('Modo de entrega explicito', function () {",
+                    "    pm.expect(['direct','mediated']).to.include(b.consumer.delivery_mode);",
+                    "});",
+                    "pm.test('Sin credenciales', function () {",
+                    "    const t = pm.response.text();",
+                    "    pm.expect(t).to.not.include('\"secret_id\"');",
+                    "    pm.expect(t).to.not.include('\"wrap_token\"');",
+                    "});",
+                ],
+            ),
+            request(
+                "POST /vault/consumers/{id}/provision - emision pendiente (202)",
+                "POST",
+                "base_url_vault_mgmt",
+                "/vault/consumers/{{consumer_id}}/provision",
+                description=(
+                    "Deja la identidad lista y la operacion en `waiting_receiver`.\n\n"
+                    "**No emite ninguna credencial todavia.** Sin receptor que la "
+                    "recoja, un SecretID emitido seria una credencial viva esperando a "
+                    "un proceso que puede no existir. Se emite cuando el receptor "
+                    "reclama, por el canal interno."
+                ),
+                headers=[{"key": "Idempotency-Key", "value": "{{$guid}}"}],
+                body={"note": "solicitado desde Postman"},
+                tests=[
+                    "pm.test('Responde 202', () => pm.response.to.have.status(202));",
+                    "const b = pm.response.json();",
+                    "pm.environment.set('operation_id', b.operation_id);",
+                    "pm.test('Sin credenciales', function () {",
+                    "    pm.expect(pm.response.text()).to.not.include('wrap_token');",
+                    "});",
+                    "console.log('Sigue el estado en GET /vault/operations/' + b.operation_id);",
+                    "console.log('Para recoger la emision: python scripts/vault_mgmt/test_receiver.py');",
+                ],
+            ),
+            request(
+                "POST /vault/consumers/{id}/rotate - rotacion controlada (202)",
+                "POST",
+                "base_url_vault_mgmt",
+                "/vault/consumers/{{consumer_id}}/rotate",
+                description=(
+                    "La estrategia es **explicita**:\n\n"
+                    "* `after_ack` (por omision): se emite la nueva y la anterior se "
+                    "retira solo cuando el receptor confirma. Lo que se retira es el "
+                    "**token** anterior, por su accessor: su SecretID ya se consumio "
+                    "al entrar. Durante la ventana ese token sigue vivo, y eso evita "
+                    "dejar fuera al crawler que ya estaba dentro.\n"
+                    "* `immediate`: se destruye la anterior al emitir la nueva. Mas "
+                    "estricto, con ventana de corte.\n\n"
+                    "En los dos casos, destruir un SecretID **no** revoca los tokens "
+                    "que ya salieron de el: viven hasta su TTL."
+                ),
+                headers=[{"key": "Idempotency-Key", "value": "{{$guid}}"}],
+                body={"strategy": "after_ack", "note": "rotacion desde Postman"},
+                tests=[
+                    "pm.test('Responde 202', () => pm.response.to.have.status(202));",
+                    "const b = pm.response.json();",
+                    "pm.environment.set('operation_id', b.operation_id);",
+                ],
+            ),
+            request(
+                "POST /vault/consumers/{id}/revoke - bloquea entregas (202)",
+                "POST",
+                "base_url_vault_mgmt",
+                "/vault/consumers/{{consumer_id}}/revoke",
+                description=(
+                    "Destruye los SecretID del rol, revoca por *accessor* el token "
+                    "acreditado y borra el rol AppRole.\n\n"
+                    "Lo que **no** consigue: borrar un rol AppRole no elimina los "
+                    "tokens ya emitidos (viven hasta su TTL si no se revocan por "
+                    "accessor) ni los secretos que el consumidor ya leyo.\n\n"
+                    "`confirm` debe ser el nombre exacto del consumidor: una "
+                    "revocacion no se dispara por un clic accidental."
+                ),
+                headers=[{"key": "Idempotency-Key", "value": "{{$guid}}"}],
+                body={"confirm": "{{consumer_name}}", "reason": "fin de la prueba"},
+                tests=[
+                    "if (pm.response.code === 422) {",
+                    "    console.warn('confirm debe ser el nombre EXACTO del consumidor.');",
+                    "    console.warn('Copialo de GET /vault/consumers/{id} -> consumer.name');",
+                    "}",
+                    "pm.test('202 o 422 segun la confirmacion', function () {",
+                    "    pm.expect([202, 422, 409]).to.include(pm.response.code);",
+                    "});",
+                    "if (pm.response.code === 202) {",
+                    "    pm.environment.set('operation_id', pm.response.json().operation_id);",
+                    "}",
+                ],
+            ),
         ],
     }
 
@@ -1453,7 +1669,297 @@ def build_collection() -> dict[str, Any]:
             lifecycle_group(),
             admin_group(),
             crawler_group(),
+            consumers_group(),
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Contrato INTERNO de aprovisionamiento (etapa 4.6)
+#
+# Va en una coleccion SEPARADA, y no es una cuestion de orden: estos dos
+# endpoints no los usa una persona. Los usa el receptor del futuro crawler, con
+# su propia credencial leida de un archivo montado. Mezclarlos con el contrato
+# humano invitaria a pegar esa credencial en el environment de alguien.
+#
+# La credencial se exporta VACIA y marcada como secreta. Quien pruebe esto a
+# mano la copia de secrets/crawler_receiver_<receptor> en su propia sesion de
+# Postman, y no la guarda.
+# ---------------------------------------------------------------------------
+
+INTERNAL_COLLECTION_PATH = OUT_DIR / "vpg-crawler-internal.postman_collection.json"
+INTERNAL_ENVIRONMENT_PATH = OUT_DIR / "vpg-crawler-internal.postman_environment.json"
+
+INTERNAL_ENVIRONMENT_VALUES: list[tuple[str, str, str]] = [
+    ("base_url_vault_mgmt", "http://127.0.0.1:8001", "default"),
+    ("base_url_vault", "http://127.0.0.1:8200", "default"),
+    ("receiver_name", "local", "default"),
+    # Credenciales: VACIAS en la exportacion, siempre.
+    ("receiver_credential", "", "secret"),
+    ("wrap_token", "", "secret"),
+    ("machine_secret_id", "", "secret"),
+    ("machine_vault_token", "", "secret"),
+    # Estado del recorrido.
+    ("consumer_id", "", "default"),
+    ("operation_id", "", "default"),
+    ("delivery_id", "", "default"),
+    ("role_id", "", "secret"),
+    ("login_path", "", "default"),
+]
+
+
+def internal_collection() -> dict[str, Any]:
+    """Los dos endpoints del canal interno, mas los dos pasos en Vault."""
+    return {
+        "info": {
+            "name": "VPG crawler - contrato interno de aprovisionamiento",
+            "description": (
+                "Lo que hara el futuro crawler en su arranque: reclamar su emision, "
+                "desenvolverla, entrar con su AppRole y confirmar.\n\n"
+                "**Esto no es el crawler**: es su contrato. Que estas cuatro "
+                "peticiones funcionen demuestra que el aprovisionamiento esta bien "
+                "implementado, no que exista un crawler.\n\n"
+                "### Autenticacion\n\n"
+                "Cabecera `X-VPG-Receiver-Credential` con la credencial del receptor, "
+                "que vive en `secrets/crawler_receiver_<receptor>` y la genera "
+                "`make all`. **Se exporta vacia**: copiala en tu sesion y no la "
+                "guardes.\n\n"
+                "Una `api_session` humana **no sirve** aqui, y esta credencial no "
+                "sirve en los endpoints humanos. Y el `consumer_id` **no es una "
+                "credencial**: el servidor lo resuelve desde la credencial "
+                "presentada, porque aceptarlo permitiria a un receptor pedir la "
+                "credencial de otro.\n\n"
+                "### Lo que protege a estos endpoints\n\n"
+                "La credencial. Estar fuera del OpenAPI publico no los vuelve "
+                "inaccesibles: comparten el puerto de la API y responden igual si se "
+                "acierta la ruta. Y el transporte es HTTP dentro de la red de Docker: "
+                "la credencial autentica, **no cifra**."
+            ),
+            "schema": SCHEMA,
+        },
+        "variable": [{"key": "internal_prefix", "value": "/internal/v1/crawler/provisioning"}],
+        "item": [
+            {
+                "name": "POST claim - reclamar la emision",
+                "request": {
+                    "method": "POST",
+                    "header": [
+                        {"key": "Content-Type", "value": "application/json"},
+                        {
+                            "key": "X-VPG-Receiver-Credential",
+                            "value": "{{receiver_credential}}",
+                        },
+                    ],
+                    "body": {
+                        "mode": "raw",
+                        "raw": '{\n  "instance": "postman-receiver"\n}',
+                        "options": {"raw": {"language": "json"}},
+                    },
+                    "url": {
+                        "raw": "{{base_url_vault_mgmt}}{{internal_prefix}}/claim",
+                        "host": ["{{base_url_vault_mgmt}}{{internal_prefix}}"],
+                        "path": ["claim"],
+                    },
+                    "auth": {"type": "noauth"},
+                    "description": (
+                        "Dos respuestas legitimas, las dos con 200:\n\n"
+                        "* `status: issued`: habia emision esperando. Lleva `role_id` y "
+                        "el **wrapping token**, de un solo uso.\n"
+                        "* `status: no_pending_request | waiting_provisioner | "
+                        "already_delivered`: todavia no hay nada, y dice por que.\n\n"
+                        "No se emite una credencial nueva encima de una entrega viva: "
+                        "dejaria la anterior huerfana en Vault."
+                    ),
+                },
+                "event": [
+                    {
+                        "listen": "test",
+                        "script": {
+                            "type": "text/javascript",
+                            "exec": [
+                                "if (pm.response.code === 401) {",
+                                "    console.warn('Falta la credencial del receptor o no es valida.');",
+                                "    console.warn('Copiala de secrets/crawler_receiver_' + pm.environment.get('receiver_name'));",
+                                "}",
+                                "pm.test('200 con la credencial correcta', () => pm.response.to.have.status(200));",
+                                "const b = pm.response.json();",
+                                "if (b.status === 'issued') {",
+                                "    pm.environment.set('consumer_id', b.consumer_id);",
+                                "    pm.environment.set('operation_id', b.operation_id);",
+                                "    pm.environment.set('delivery_id', b.delivery_id);",
+                                "    pm.environment.set('role_id', b.role_id);",
+                                "    pm.environment.set('wrap_token', b.wrap_token);",
+                                "    pm.environment.set('login_path', b.login_path);",
+                                "    pm.test('La envoltura trae TTL', () => pm.expect(b.wrap_ttl_seconds).to.be.above(0));",
+                                "    pm.test('No viene el secret_id en claro', function () {",
+                                "        pm.expect(b).to.not.have.property('secret_id');",
+                                "    });",
+                                "    console.log('La operacion esta en awaiting_ack: NO esta completa.');",
+                                "} else {",
+                                "    console.log('status=' + b.status + ': ' + b.detail);",
+                                "}",
+                            ],
+                        },
+                    }
+                ],
+            },
+            {
+                "name": "POST sys/wrapping/unwrap - desenvolver (UN SOLO USO)",
+                "request": {
+                    "method": "POST",
+                    "header": [
+                        {"key": "Content-Type", "value": "application/json"},
+                        {"key": "X-Vault-Token", "value": "{{wrap_token}}"},
+                    ],
+                    "body": {"mode": "raw", "raw": "{}", "options": {"raw": {"language": "json"}}},
+                    "url": {
+                        "raw": "{{base_url_vault}}/v1/sys/wrapping/unwrap",
+                        "host": ["{{base_url_vault}}"],
+                        "path": ["v1", "sys", "wrapping", "unwrap"],
+                    },
+                    "auth": {"type": "noauth"},
+                    "description": (
+                        "Lo hace **el receptor**, contra Vault, no la API.\n\n"
+                        "Un wrapping token se consume una vez. Si esto falla porque ya "
+                        "se uso o caduco, hay que volver a reclamar la emision: no se "
+                        "reintenta el unwrap."
+                    ),
+                },
+                "event": [
+                    {
+                        "listen": "test",
+                        "script": {
+                            "type": "text/javascript",
+                            "exec": [
+                                "pm.test('200 al desenvolver', () => pm.response.to.have.status(200));",
+                                "const d = pm.response.json().data || {};",
+                                "if (d.secret_id) {",
+                                "    pm.environment.set('machine_secret_id', d.secret_id);",
+                                "    console.log('secret_id obtenido. No lo guardes en ningun archivo.');",
+                                "} else {",
+                                "    console.warn('La envoltura no traia secret_id.');",
+                                "}",
+                            ],
+                        },
+                    }
+                ],
+            },
+            {
+                "name": "POST approle/login - entrar con la credencial",
+                "request": {
+                    "method": "POST",
+                    "header": [{"key": "Content-Type", "value": "application/json"}],
+                    "body": {
+                        "mode": "raw",
+                        "raw": '{\n  "role_id": "{{role_id}}",\n  "secret_id": "{{machine_secret_id}}"\n}',
+                        "options": {"raw": {"language": "json"}},
+                    },
+                    "url": {
+                        "raw": "{{base_url_vault}}/v1/{{login_path}}",
+                        "host": ["{{base_url_vault}}"],
+                        "path": ["v1", "{{login_path}}"],
+                    },
+                    "auth": {"type": "noauth"},
+                    "description": (
+                        "El token resultante se queda en el runtime del receptor y "
+                        "**nunca llega a React**. En el `ack` se envia solo para que el "
+                        "servidor lo compruebe, y se descarta."
+                    ),
+                },
+                "event": [
+                    {
+                        "listen": "test",
+                        "script": {
+                            "type": "text/javascript",
+                            "exec": [
+                                "pm.test('200 en el login', () => pm.response.to.have.status(200));",
+                                "const a = pm.response.json().auth || {};",
+                                "pm.environment.set('machine_vault_token', a.client_token || '');",
+                                "pm.test('El token lleva la politica gestionada', function () {",
+                                "    pm.expect((a.token_policies || []).join(',')).to.include('crawler');",
+                                "});",
+                                "console.log('accessor=' + a.accessor + '  ttl=' + a.lease_duration + 's');",
+                            ],
+                        },
+                    }
+                ],
+            },
+            {
+                "name": "POST ack - confirmar acreditando el token",
+                "request": {
+                    "method": "POST",
+                    "header": [
+                        {"key": "Content-Type", "value": "application/json"},
+                        {
+                            "key": "X-VPG-Receiver-Credential",
+                            "value": "{{receiver_credential}}",
+                        },
+                    ],
+                    "body": {
+                        "mode": "raw",
+                        "raw": (
+                            '{\n  "delivery_id": "{{delivery_id}}",'
+                            '\n  "vault_token": "{{machine_vault_token}}",'
+                            '\n  "instance": "postman-receiver"\n}'
+                        ),
+                        "options": {"raw": {"language": "json"}},
+                    },
+                    "url": {
+                        "raw": "{{base_url_vault_mgmt}}{{internal_prefix}}/ack",
+                        "host": ["{{base_url_vault_mgmt}}{{internal_prefix}}"],
+                        "path": ["ack"],
+                    },
+                    "auth": {"type": "noauth"},
+                    "description": (
+                        "El servidor hace `auth/token/lookup` con ese token y verifica "
+                        "montaje, rol y politica esperados **antes** de marcar "
+                        "`completed`. Un `success: true` del cliente no serviria: no "
+                        "prueba que se autenticara.\n\n"
+                        "Despues se descarta el token. Lo que queda en el catalogo es su "
+                        "*accessor*, que permite revocarlo sin tenerlo."
+                    ),
+                },
+                "event": [
+                    {
+                        "listen": "test",
+                        "script": {
+                            "type": "text/javascript",
+                            "exec": [
+                                "if (pm.response.code === 403) {",
+                                "    console.warn('El token no corresponde a la identidad de este consumidor.');",
+                                "}",
+                                "pm.test('200 al confirmar', () => pm.response.to.have.status(200));",
+                                "const b = pm.response.json();",
+                                "pm.test('La operacion queda completed', () => pm.expect(b.status).to.eql('completed'));",
+                                "pm.test('El consumidor queda ready', () => pm.expect(b.provisioning_state).to.eql('ready'));",
+                                "pm.test('Devuelve el accessor, no el token', function () {",
+                                "    pm.expect(b.token_accessor).to.be.a('string');",
+                                "    pm.expect(pm.response.text()).to.not.include(pm.environment.get('machine_vault_token'));",
+                                "});",
+                                "console.log('Limpia las variables secretas cuando acabes.');",
+                            ],
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def build_internal_environment() -> dict[str, Any]:
+    return {
+        "id": "vpg-crawler-internal-env",
+        "name": "VPG crawler interno (local)",
+        "values": [
+            {
+                "key": key,
+                "value": "" if kind == "secret" else value,
+                "type": kind,
+                "enabled": True,
+            }
+            for key, value, kind in INTERNAL_ENVIRONMENT_VALUES
+        ],
+        "_postman_variable_scope": "environment",
     }
 
 
@@ -1606,12 +2112,28 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(environment, indent=1, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
+    INTERNAL_COLLECTION_PATH.write_text(
+        json.dumps(internal_collection(), indent=1, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    INTERNAL_ENVIRONMENT_PATH.write_text(
+        json.dumps(build_internal_environment(), indent=1, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
     print("==> Escritos")
-    for path in (COLLECTION_PATH, ENVIRONMENT_PATH):
+    for path in (
+        COLLECTION_PATH,
+        ENVIRONMENT_PATH,
+        INTERNAL_COLLECTION_PATH,
+        INTERNAL_ENVIRONMENT_PATH,
+    ):
         print(f"    {path.relative_to(REPO_ROOT)}  ({path.stat().st_size} bytes)")
     secretas = [key for key, _v, kind in ENVIRONMENT_VALUES if kind == "secret"]
     print(f"    variables secretas exportadas VACIAS: {', '.join(secretas)}")
     print("    los wrapping tokens no se guardan en ninguna variable")
+    internas = [k for k, _v, t in INTERNAL_ENVIRONMENT_VALUES if t == "secret"]
+    print(f"    contrato interno, secretas y VACIAS: {', '.join(internas)}")
     return 0
 
 
