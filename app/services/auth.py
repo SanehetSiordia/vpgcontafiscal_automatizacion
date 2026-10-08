@@ -22,7 +22,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.errors import ForbiddenError, UnauthenticatedError, UpstreamUnavailableError
 from app.core.logging import get_logger
-from app.core.security import ApiSession, PendingChallenge, SessionStore
+from app.core.security import (
+    ApiSession,
+    MfaProof,
+    PendingChallenge,
+    SessionStore,
+    StepUpChallenge,
+)
 from app.core.vault import (
     VaultClient,
     VaultError,
@@ -210,6 +216,131 @@ class AuthService:
             user_id=user.id, username=user.username, vault=vault_session
         )
         return api_session, roles
+
+    # -- reautenticacion para operaciones destructivas (etapa 4) -------------
+
+    async def begin_step_up(
+        self,
+        *,
+        api_session: ApiSession,
+        password: str,
+        operation: str,
+        collection_id: uuid.UUID | None,
+        resource_ids: tuple[uuid.UUID, ...],
+    ) -> StepUpChallenge:
+        """Paso 1 de la reautenticacion: contrasena del TITULAR de la sesion.
+
+        No se admite reautenticar a nombre de otra persona: el usuario sale de
+        la sesion, no del cuerpo. La operacion y el conjunto de recursos quedan
+        fijados **antes** de pedir el codigo, de modo que la prueba resultante
+        no pueda reutilizarse para otra cosa.
+        """
+        try:
+            challenge = await self._vault.userpass_login(api_session.username, password)
+        except VaultInvalidCredentials as exc:
+            raise UnauthenticatedError(
+                "la contrasena no es correcta", code="step_up_failed"
+            ) from exc
+        except VaultSealed as exc:
+            raise UpstreamUnavailableError(
+                "Vault esta sellado: desbloquealo (paso manual) y reintenta"
+            ) from exc
+        except VaultUnavailable as exc:
+            raise UpstreamUnavailableError(f"Vault no responde: {exc.message}") from exc
+        finally:
+            del password
+
+        if challenge.token_issued_without_mfa:
+            logger.error(
+                "vault emitio token sin exigir MFA en una reautenticacion",
+                extra={"operation": "step_up", "actor": api_session.username},
+            )
+            raise ForbiddenError(
+                "el enforcement MFA no esta cubriendo el montaje userpass; "
+                "la reautenticacion se rechaza por seguridad",
+                code="mfa_not_enforced",
+            )
+        if not challenge.mfa_request_id or not challenge.method_ids:
+            raise UpstreamUnavailableError(
+                "Vault no devolvio un desafio MFA valido para este usuario"
+            )
+
+        return await self._sessions.create_step_up(
+            session_id=api_session.session_id,
+            user_id=api_session.user_id,
+            username=api_session.username,
+            mfa_request_id=challenge.mfa_request_id,
+            method_id=challenge.method_ids[0],
+            operation=operation,
+            collection_id=collection_id,
+            resource_ids=resource_ids,
+        )
+
+    async def complete_step_up(self, challenge_id: str, code: str) -> MfaProof:
+        """Paso 2: codigo TOTP del titular. Devuelve la prueba breve.
+
+        El codigo se valida **contra Vault**, no contra PostgreSQL: aqui no hay
+        semillas ni se comparan digitos. El token que Vault emite al validar no
+        se usa para nada y se revoca de inmediato: la sesion ya tiene el suyo y
+        dejar vivo otro token humano seria superficie gratuita.
+        """
+        challenge = await self._sessions.pop_step_up(challenge_id)
+        if challenge is None:
+            raise UnauthenticatedError(
+                "la reautenticacion no existe o ha caducado; repitela",
+                code="step_up_expired",
+            )
+
+        # La sesion debe seguir viva: una prueba no sobrevive a su sesion.
+        live = await self._sessions.get_session(challenge.session_id)
+        if live is None:
+            raise UnauthenticatedError(
+                "la sesion de la reautenticacion ya no existe", code="session_expired"
+            )
+
+        try:
+            vault_session = await self._vault.mfa_validate(
+                challenge.mfa_request_id, challenge.method_id, code
+            )
+        except VaultMFAFailed as exc:
+            raise UnauthenticatedError(exc.message, code="mfa_failed") from exc
+        except VaultSealed as exc:
+            raise UpstreamUnavailableError(f"Vault: {exc.message}") from exc
+        except VaultUnavailable as exc:
+            raise UpstreamUnavailableError(f"Vault no responde: {exc.message}") from exc
+        finally:
+            del code
+
+        # Comprobacion de identidad: el codigo tiene que ser del titular.
+        if (
+            vault_session.entity_id
+            and live.entity_id
+            and vault_session.entity_id != live.entity_id
+        ):
+            await self._vault.revoke_self(vault_session.client_token)
+            logger.error(
+                "entity_id de la reautenticacion distinto del de la sesion",
+                extra={"operation": "step_up", "target": str(challenge.user_id)},
+            )
+            raise ForbiddenError(
+                "la reautenticacion no corresponde al titular de la sesion",
+                code="entity_mismatch",
+            )
+
+        await self._vault.revoke_self(vault_session.client_token)
+
+        proof = await self._sessions.create_proof(challenge)
+        logger.info(
+            "reautenticacion MFA correcta",
+            extra={
+                "operation": "step_up",
+                "actor": challenge.username,
+                "target_operation": challenge.operation,
+                "resources": len(challenge.resource_ids),
+                "status": "ok",
+            },
+        )
+        return proof
 
     # -- cierre --------------------------------------------------------------
 

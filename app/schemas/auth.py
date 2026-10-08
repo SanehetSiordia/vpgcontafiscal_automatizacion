@@ -301,6 +301,42 @@ class AccessCheckOut(BaseModel):
     )
 
 
+class StepUpChallengeOut(BaseModel):
+    """Paso 1 de la reautenticacion. Todavia NO hay prueba de MFA."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "challenge_id": "aV9kQ2p-ejemplo",
+                "mfa_required": True,
+                "operation": "record_purge",
+                "collection_id": "3f2a7c18-2d44-4a90-9f4c-1b5e6a7d8c90",
+                "resource_ids": ["8c902d44-1b5e-4a90-9f4c-3f2a7c18ab01"],
+                "method_name": "vpg-totp",
+                "expires_in_seconds": 180,
+                "message": (
+                    "Reautenticacion incompleta: envia el codigo TOTP a "
+                    "/auth/mfa/step-up/verify."
+                ),
+            }
+        }
+    )
+
+    challenge_id: str = Field(description="Identificador opaco. No es una prueba.")
+    mfa_required: Literal[True] = True
+    operation: str = Field(description="Operacion que autorizara la prueba resultante.")
+    collection_id: uuid.UUID | None
+    resource_ids: list[uuid.UUID] = Field(
+        description="Conjunto cerrado de recursos. La prueba no cubrira ningun otro."
+    )
+    method_name: str
+    expires_in_seconds: int
+    message: str = (
+        "Reautenticacion incompleta: envia el codigo TOTP del titular a "
+        "/auth/mfa/step-up/verify antes de que caduque el desafio."
+    )
+
+
 class LiveOut(BaseModel):
     status: Literal["alive"] = "alive"
 

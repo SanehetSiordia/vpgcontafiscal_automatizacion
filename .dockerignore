@@ -12,6 +12,9 @@
 !requirements/user_mgmt-dev.txt
 !tests/**/*.py
 !pytest.ini
+# Etapa 4: requisitos propios de vault-mgmt-service.
+!requirements/vault_mgmt.txt
+!requirements/vault_mgmt-dev.txt
 
 # Explícito, aunque ya queda excluido por la regla anterior.
 .env

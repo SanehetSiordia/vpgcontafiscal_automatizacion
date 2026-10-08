@@ -26,6 +26,7 @@ from app.core.vault import VaultClient
 from app.repositories import users as users_repo
 from app.services.auth import AuthService
 from app.services.rbac import Principal
+from app.services.vault_gateway import VaultGatewayService
 from app.services.vault_sync import VaultSyncService
 
 bearer_scheme = HTTPBearer(
@@ -64,6 +65,11 @@ def get_auth_service(request: Request) -> AuthService:
 
 def get_vault_sync(request: Request) -> VaultSyncService:
     return request.app.state.vault_sync
+
+
+def get_vault_gateway(request: Request) -> VaultGatewayService:
+    """Pasarela interna de la etapa 4. Solo la usan los endpoints /internal/v1."""
+    return request.app.state.vault_gateway
 
 
 async def get_db(request: Request) -> AsyncIterator[AsyncSession]:

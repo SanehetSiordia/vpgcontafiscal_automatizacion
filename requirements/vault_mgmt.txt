@@ -1,0 +1,37 @@
+# Dependencias de ejecucion de vault-mgmt-service (FastAPI, etapa 4).
+# Versiones FIJADAS: una reconstruccion da la misma imagen.
+#
+# Se reutilizan las MISMAS versiones ya probadas en user-mgmt (requirements/
+# user_mgmt.txt) a proposito: las dos imagenes salen del mismo arbol `app/` y
+# comparten modulos (app/core/errors.py, logging.py, rate_limit.py, vault.py,
+# vault_kv.py y secret_schema.py). Dos versiones distintas de Pydantic o de
+# SQLAlchemy sobre el mismo codigo seria pedir problemas sin ganar nada.
+#
+# Notas de python:3.12-alpine (musl) que ya estan comprobadas en este proyecto:
+#   * psycopg[binary] NO publica rueda para musl: no es una opcion.
+#   * psycopg[c]==3.2.3 no compila con el gcc 15 de Alpine 3.22; 3.2.13 si.
+#   * la implementacion pura de Python no resuelve libpq en musl.
+#   * se evita `uvicorn[standard]`: arrastra watchfiles (cadena de Rust) y solo
+#     hace falta para --reload, que este servicio no usa.
+#
+# NO hay dependencia nueva para validar JSON Schema. El validador vive en
+# app/core/secret_schema.py y cubre el subconjunto cerrado que este servicio
+# genera, sin $ref, sin resolucion de URI y sin ejecucion de codigo. La
+# alternativa (`jsonschema`) arrastra `rpds-py`, que es una extension compilada
+# en Rust: en musl eso significa depender de que exista una rueda musllinux o
+# meter cargo en la etapa builder. El limite de esta decision esta escrito en el
+# propio modulo y en el README.
+
+fastapi==0.142.2
+starlette==1.7.0
+uvicorn==0.54.0
+uvloop==0.23.0
+httptools==0.8.0
+
+sqlalchemy[asyncio]==2.1.3
+psycopg[c,pool]==3.2.13
+
+pydantic==2.13.5
+pydantic-settings==2.15.0
+
+httpx==0.28.1

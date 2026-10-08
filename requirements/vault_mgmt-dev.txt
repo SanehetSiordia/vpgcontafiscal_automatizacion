@@ -1,0 +1,10 @@
+# Dependencias SOLO de pruebas de vault-mgmt-service. No entran en la imagen de
+# runtime. Se instalan sobre las de vault_mgmt.txt:
+#   pip install -r requirements/vault_mgmt.txt -r requirements/vault_mgmt-dev.txt
+#
+# Mismas versiones que requirements/user_mgmt-dev.txt: las dos suites corren con
+# el mismo pytest.ini y comparten fixtures de estilo.
+
+pytest==8.4.2
+pytest-asyncio==1.3.0
+anyio==4.15.1
