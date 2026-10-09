@@ -289,6 +289,116 @@ services:
       vault-service:
         condition: service_started
 
+  # ---------------------------------------------------------------------------
+  # Frontend (etapa 5.1)
+  #
+  # Nginx con los estaticos ya construidos. Dos cosas que NO tiene, y es lo que
+  # lo mantiene barato de razonar:
+  #
+  #   * NO monta el directorio secrets/ completo, ni el token inicial de Vault,
+  #     ni la clave de unseal, ni ninguna credencial interna. En modo HTTPS
+  #     recibe exactamente dos archivos de solo lectura: el certificado y su
+  #     clave.
+  #   * NO tiene volumen persistente. El paquete estatico vive EN la imagen; si
+  #     cambia el codigo, cambia la imagen.
+  #
+  # El modo (HTTP local o HTTPS) se decide en el arranque con estas variables,
+  # no reconstruyendo la imagen.
+  # ---------------------------------------------------------------------------
+  frontend-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: frontend-server
+      args:
+        NODE_VERSION: ${NODE_VERSION}
+        NGINX_VERSION: ${NGINX_VERSION}
+    image: vpg/frontend-server:${FRONTEND_VERSION}
+    container_name: ${FRONTEND_CONTAINER_NAME}
+    hostname: frontend-service
+    restart: unless-stopped
+    environment:
+      # Variables NO sensibles y NO VITE_*: estas las lee Nginx en el arranque,
+      # asi que cambiar de modo no obliga a reconstruir el paquete.
+      FRONTEND_ACCESS_SCOPE: ${FRONTEND_ACCESS_SCOPE}
+      FRONTEND_HTTPS_ENABLED: ${FRONTEND_HTTPS_ENABLED}
+      FRONTEND_HTTP_PORT: ${FRONTEND_HTTP_PORT}
+      FRONTEND_HTTPS_PORT: ${FRONTEND_HTTPS_PORT}
+      FRONTEND_HEALTH_PORT: ${FRONTEND_HEALTH_PORT}
+      FRONTEND_PUBLIC_HOST: ${FRONTEND_PUBLIC_HOST}
+      # Llega para poder comprobarlo dentro: cambiar solo el bind no debe
+      # permitir publicar en la LAN sin HTTPS.
+      FRONTEND_HOST_BIND: ${FRONTEND_HOST_BIND}
+    secrets:
+      # Solo el par TLS, y solo de lectura. En modo HTTP los archivos pueden
+      # estar vacios: Nginx no los abre y el arranque lo dice.
+      - frontend_tls_cert
+      - frontend_tls_key
+    ports:
+      # En modo HTTP local, el bind es 127.0.0.1 y el 8443 queda publicado sin
+      # nada escuchando detras (conexion rechazada). Compose no admite mapeos
+      # condicionales; si ese puerto estorba, se cambia en .env.
+      - "${FRONTEND_HOST_BIND}:${FRONTEND_HTTP_PORT}:${FRONTEND_HTTP_PORT}"
+      - "${FRONTEND_HOST_BIND}:${FRONTEND_HTTPS_PORT}:${FRONTEND_HTTPS_PORT}"
+    networks:
+      - ${DOCKER_NETWORK_NAME}
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      # service_started y NO service_healthy, por el mismo criterio que el resto
+      # del proyecto: si user-mgmt no esta listo (Vault sellado, por ejemplo),
+      # el frontend debe poder servirse y explicar el 503, no quedarse sin
+      # arrancar y dejar al operador sin pantalla donde leer el motivo.
+      user-mgmt-service:
+        condition: service_started
+    healthcheck:
+      # Contra la escucha interna de salud, siempre por HTTP. No consulta al
+      # backend: fingir aqui la salud de user-mgmt solo serviria para que un
+      # backend caido pareciera sano.
+      test: ["CMD-SHELL", "wget --quiet --spider http://127.0.0.1:${FRONTEND_HEALTH_PORT}/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Perfil de DESARROLLO del frontend (etapa 5.1). Opcional y aparte.
+  #
+  # Lleva `profiles: [dev]`, asi que NO lo levanta 'docker compose up' ni
+  # 'make all': solo aparece si se pide a mano. Es deliberado, porque este
+  # servicio es lo contrario del runtime:
+  #
+  #   * ejecuta Vite con recarga en caliente, que necesita scripts en linea y
+  #     una conexion de HMR. Esos permisos NO deben llegar al runtime, y no
+  #     llegan: el de 'make all' es Nginx con la CSP estricta y sin Vite;
+  #   * monta el codigo fuente y usa node_modules del equipo (en el volumen del
+  #     repositorio), en vez de un paquete construido dentro de la imagen.
+  #
+  # Antes de la primera vez:  bash scripts/frontend/npm.sh ci
+  # Arranque:                 bash scripts/frontend/dev.sh
+  # ---------------------------------------------------------------------------
+  frontend-dev:
+    profiles:
+      - dev
+    image: node:${NODE_VERSION}
+    container_name: ${FRONTEND_DEV_CONTAINER_NAME:-vpg-frontend-dev}
+    hostname: frontend-dev
+    working_dir: /app
+    command: ["npm", "run", "dev"]
+    volumes:
+      # Solo frontend/: este contenedor no ve secrets/ ni el resto del arbol.
+      - ./frontend:/app
+    ports:
+      # Siempre en loopback: el perfil de desarrollo no se comparte en la LAN.
+      - "127.0.0.1:${FRONTEND_DEV_PORT:-5173}:5173"
+    networks:
+      # En la red del proyecto para que el proxy de Vite alcance a
+      # user-mgmt-service por su nombre, igual que lo hace Nginx.
+      - ${DOCKER_NETWORK_NAME}
+    depends_on:
+      user-mgmt-service:
+        condition: service_started
+
 volumes:
   vault-data:
     name: ${VAULT_VOLUME_NAME}
@@ -337,3 +447,14 @@ secrets:
   # codigo (app/vault_mgmt/core/approle_admin.py), no la ACL de Vault.
   vault_provisioner_token:
     file: ./secrets/VAULT_INITIAL_TOKEN
+  # --- Etapa 5.1 -------------------------------------------------------------
+  # Par TLS del frontend, y nada mas. Las rutas salen de .env para que el mismo
+  # compose.yaml sirva con un certificado de mkcert, uno del despacho o ninguno.
+  #
+  # Los dos archivos deben EXISTIR para que 'docker compose config' valide,
+  # aunque esten vacios: 'make all' los crea vacios si faltan y el arranque
+  # rechaza un modo HTTPS con material vacio o invalido, diciendo por que.
+  frontend_tls_cert:
+    file: ${FRONTEND_TLS_CERT_FILE}
+  frontend_tls_key:
+    file: ${FRONTEND_TLS_KEY_FILE}

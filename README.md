@@ -8,7 +8,7 @@ Automatizacion Inteligente para contabilidad fiscal VPG
 | [3. user-mgmt-service (FastAPI)](readme/etapa-3-user-mgmt-service.md) | listo | `user-mgmt-service` |
 | [4. vault-mgmt-service (CRUD de secretos)](readme/etapa-4-vault-mgmt-service.md) | listo | `vault-mgmt-service` |
 | [4.6 Aprovisionamiento de consumidores](readme/etapa-4-6-aprovisionamiento.md) | listo | `vault-mgmt-worker` |
-| 5. Frontend | **no implementado**: estas etapas terminan en el backend | — |
+| [5.1 Frontend de autenticación](readme/etapa-5-1-frontend.md) | listo | `frontend-service` |
 | 6. Crawler | **no implementado**: las etapas 4 y 4.6 entregan su *contrato de consumo*, no el crawler | — |
 
 Este archivo es el **índice**. La documentación de cada etapa vive en
@@ -60,6 +60,24 @@ contrato de consumo del futuro crawler.
 - [Pruebas unitarias (etapa 4)](readme/etapa-4-vault-mgmt-service.md#pruebas-unitarias-etapa-4)
 - [Seguridad (etapa 4)](readme/etapa-4-vault-mgmt-service.md#seguridad-etapa-4)
 
+### [Etapa 5.1 · Frontend de autenticación](readme/etapa-5-1-frontend.md)
+
+El primer frontend, en `127.0.0.1:8080`: React + TypeScript servido por Nginx
+desde el **mismo origen** que la API, con login de dos pasos, verificación TOTP,
+sesión **solo en memoria**, aviso del estado del segundo factor, inscripción
+inicial del TOTP propio y una pantalla administrativa mínima para inscribir o
+reiniciar el de otra persona. Añade la **única** ampliación de contrato del
+backend de esta etapa: estado histórico en el desafío y una autorización de
+inscripción de un solo uso.
+
+- [El contrato con user-mgmt y la tabla DTO ↔ TypeScript](readme/etapa-5-1-frontend.md#2-el-contrato-con-user-mgmt)
+- [Inscripción inicial del TOTP del administrador](readme/etapa-5-1-frontend.md#3-inscripción-inicial-del-totp-del-administrador)
+- [El aviso de pending y el QR](readme/etapa-5-1-frontend.md#5-el-aviso-de-pending-y-el-qr)
+- [Cabeceras de seguridad y CSP](readme/etapa-5-1-frontend.md#7-cabeceras-de-seguridad-y-csp)
+- [HTTP local y HTTPS: modos, matriz y certificados](readme/etapa-5-1-frontend.md#8-http-local-y-https-modos-matriz-y-certificados)
+- [Pruebas y qué demuestra cada una](readme/etapa-5-1-frontend.md#10-pruebas-y-qué-demuestra-cada-una)
+- [Seguridad y limitaciones conocidas](readme/etapa-5-1-frontend.md#12-seguridad-y-limitaciones-conocidas-etapa-51)
+
 ### [Etapa 4.6 · Aprovisionamiento de consumidores](readme/etapa-4-6-aprovisionamiento.md)
 
 El alta y el aprovisionamiento de una identidad de maquina **desde la API**, con
@@ -93,6 +111,7 @@ aquí solo está la secuencia y dónde buscarla.
 | 7 | `docker compose up -d` y comprobar salud de las dos APIs | [etapa 4](readme/etapa-4-vault-mgmt-service.md#3-arrancar) |
 | 8 | Recorrido interactivo de comprobación: `bash scripts/vault_mgmt/walkthrough.sh` | [etapa 4](readme/etapa-4-vault-mgmt-service.md#6--interactivo--recorrido-crud-completo) |
 | 9 | Alta y aprovisionamiento de un consumidor de máquina | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#comprobaciones-reproducibles-etapa-46) |
+| 10 | Abrir el frontend y recorrer el login de dos pasos | [etapa 5.1](readme/etapa-5-1-frontend.md#11-recorrido-manual-necesita-un-teléfono) |
 
 > **Desde la etapa 4.6 hay un atajo para casi todo esto: `make all`.** Valida
 > herramientas, arranca, **inicializa Vault si el volumen es nuevo**, lo
@@ -127,6 +146,10 @@ aquí solo está la secuencia y dónde buscarla.
 | Por qué un consumidor heredado no está acotado por sus bindings | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#entrega-mediada-y-consumidores-heredados) |
 | Rotar o revocar una credencial de máquina | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#rotación-y-revocación) |
 | Qué hace `make all`, `make down` y `make purge` | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#arranque-con-make-all) |
+| Entrar por el navegador: login, TOTP y cierre de sesión | [etapa 5.1](readme/etapa-5-1-frontend.md#4-pantallas-estado-y-lo-que-cada-una-promete) |
+| Inscribir el segundo factor de alguien (o el propio) | [etapa 5.1](readme/etapa-5-1-frontend.md#6-configuracion-totp-la-herramienta-administrativa) |
+| Pasar el frontend de HTTP local a HTTPS en la LAN | [etapa 5.1](readme/etapa-5-1-frontend.md#8-http-local-y-https-modos-matriz-y-certificados) |
+| CSP, cabeceras de seguridad y qué comprueba cada guion | [etapa 5.1](readme/etapa-5-1-frontend.md#7-cabeceras-de-seguridad-y-csp) |
 | Qué cambia (y qué no) con el auto-unseal de GCP | [etapa 4.6](readme/etapa-4-6-aprovisionamiento.md#evolución-a-gcp-fuera-de-esta-etapa) |
 | Recorrer el CRUD de secretos de punta a punta | [etapa 4 · comprobación 6](readme/etapa-4-vault-mgmt-service.md#6--interactivo--recorrido-crud-completo) (`walkthrough.sh`) |
 | Un fallo parcial y cómo reconciliarlo | [etapa 4 · comprobación 9](readme/etapa-4-vault-mgmt-service.md#9-fallo-parcial-y-reconciliación) |
@@ -147,6 +170,8 @@ aquí solo está la secuencia y dónde buscarla.
 | `config/` | `vault.hcl` y las políticas de Vault en `config/policies/` |
 | `requirements/` | Dependencias fijadas, un archivo por componente y por entorno |
 | `tests/` | `tests/` (etapa 3) y `tests/vault_mgmt/` (etapas 4 y 4.6) |
+| `frontend/` | El frontend de la etapa 5.1: React + TypeScript, con su lockfile y sus pruebas en `src/` |
+| `docker/frontend/` | Runtime de Nginx del frontend: configuración, plantillas por modo y entrypoint |
 | `postman/` | Colecciones y environments, uno por API |
 | `secrets/` | Archivos de Compose secret. **Fuera de Git y del contexto de build** |
 

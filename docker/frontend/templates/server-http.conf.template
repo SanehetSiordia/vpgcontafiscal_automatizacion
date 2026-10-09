@@ -1,0 +1,39 @@
+# -----------------------------------------------------------------------------
+# Modo HTTP (solo alcance 'local' y solo en loopback del host).
+#
+# Sin HSTS y sin upgrade-insecure-requests: en este modo no hay HTTPS al que
+# ascender, y una politica persistente en el navegador dejaria inaccesible el
+# propio entorno local cuando se vuelva a HTTP.
+# -----------------------------------------------------------------------------
+
+# Escucha interna de salud. No se publica en el host: solo la usa el
+# healthcheck del contenedor, siempre por HTTP y siempre sin TLS, de modo que
+# un fallo de certificados no se "arregle" con una comprobacion insegura.
+server {
+  listen 127.0.0.1:${FRONTEND_HEALTH_PORT};
+  server_name _;
+  access_log off;
+
+  location = /healthz {
+    add_header Cache-Control "no-store" always;
+    default_type application/json;
+    return 200 '{"status":"ok","service":"frontend-service","mode":"http"}';
+  }
+
+  location / {
+    return 404;
+  }
+}
+
+server {
+  listen ${FRONTEND_HTTP_PORT};
+  server_name _;
+  root /usr/share/nginx/html;
+  index index.html;
+  charset utf-8;
+
+  # Para X-Forwarded-Proto en la pasarela: aqui el origen es HTTP y se dice.
+  set $vpg_scheme "http";
+
+  include /etc/nginx/vpg/snippets/app.conf;
+}

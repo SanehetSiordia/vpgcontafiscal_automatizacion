@@ -233,5 +233,15 @@ secrets/
 *.pgpass
 .pgpass
 
+# VPG Contadores - frontend (etapa 5.1)
+# El lockfile SI entra en el repositorio: es lo que hace reproducible el build.
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+*.tsbuildinfo
+# Material TLS del frontend. Vive en secrets/, que ya esta excluido entero;
+# queda anotado aqui para que se vea al leer este archivo.
+secrets/frontend-tls/
+
 #Paths
 postman/*

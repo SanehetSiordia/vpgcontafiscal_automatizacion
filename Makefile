@@ -35,7 +35,8 @@
 #                   migraciones y credenciales tecnicas (incluida la credencial
 #                   de cada receptor de la etapa 4.6), comprueba el
 #                   administrador y levanta las dos APIs y el worker de
-#                   aprovisionamiento. Un volumen YA inicializado nunca se
+#                   aprovisionamiento, y publica el frontend tras validar su
+#                   alcance, su bind y su material TLS. Un volumen YA inicializado nunca se
 #                   reinicializa; si falta su Unseal Key, la pide una vez,
 #                   porque Vault no la vuelve a mostrar.
 #   make down       Detiene y elimina contenedores y red. CONSERVA volumenes,
@@ -319,13 +320,19 @@ POSTGRES_VERSION=$$(env_req POSTGRES_VERSION)
 PYTHON_VERSION=$$(env_req PYTHON_VERSION)
 USER_MGMT_VERSION=$$(env_req USER_MGMT_VERSION)
 VAULT_MGMT_VERSION=$$(env_req VAULT_MGMT_VERSION)
+NODE_VERSION=$$(env_req NODE_VERSION)
+NGINX_VERSION=$$(env_req NGINX_VERSION)
+FRONTEND_VERSION=$$(env_req FRONTEND_VERSION)
 IMG_VAULT="vpg/vault-server:$$VAULT_VERSION"
 IMG_PG="vpg/postgres-server:$$POSTGRES_VERSION"
 IMG_UM="vpg/user-mgmt-server:$$USER_MGMT_VERSION"
 IMG_VM="vpg/vault-mgmt-server:$$VAULT_MGMT_VERSION"
+IMG_FE="vpg/frontend-server:$$FRONTEND_VERSION"
 BASE_VAULT="hashicorp/vault:$$VAULT_VERSION"
 BASE_PG="postgres:$$POSTGRES_VERSION"
 BASE_PY="python:$$PYTHON_VERSION"
+BASE_NODE="node:$$NODE_VERSION"
+BASE_NGINX="nginx:$$NGINX_VERSION"
 PG_DB=$$(env_req POSTGRES_DB)
 PG_USER=$$(env_req POSTGRES_USER)
 PG_APP=$$(env_req POSTGRES_APP_USER)
@@ -344,6 +351,25 @@ VM_BIND=$$(env_req VAULT_MGMT_HOST_BIND)
 VM_PORT=$$(env_req VAULT_MGMT_PORT_LOCAL)
 UM_URL="http://$$UM_BIND:$$UM_PORT"
 VM_URL="http://$$VM_BIND:$$VM_PORT"
+# --- etapa 5.1: frontend ---------------------------------------------------
+FE_BIND=$$(env_req FRONTEND_HOST_BIND)
+FE_PORT=$$(env_req FRONTEND_HTTP_PORT)
+FE_PORT_TLS=$$(env_req FRONTEND_HTTPS_PORT)
+FE_TLS=$$(env_get FRONTEND_HTTPS_ENABLED); FE_TLS=$${FE_TLS:-false}
+FE_ALCANCE=$$(env_get FRONTEND_ACCESS_SCOPE); FE_ALCANCE=$${FE_ALCANCE:-local}
+FE_HOST=$$(env_get FRONTEND_PUBLIC_HOST); FE_HOST=$${FE_HOST:-localhost}
+FE_CERT=$$(env_get FRONTEND_TLS_CERT_FILE); FE_CERT=$${FE_CERT:-./secrets/frontend-tls/tls.crt}
+# OJO: FRONTEND_TLS_KEY_FILE lleva "KEY" en el nombre, asi que cargar_env la
+# SALTA por si fuera un secreto. Aqui es una RUTA, no una clave, asi que se lee
+# aparte y con el comentario a la vista para que nadie lo tome por un descuido.
+FE_KEY=$$(sed -n 's/^[[:space:]]*FRONTEND_TLS_KEY_FILE=//p' "$$ENV_FILE" 2>/dev/null | head -n 1 | tr -d '
+')
+FE_KEY=$${FE_KEY:-./secrets/frontend-tls/tls.key}
+if [ "$$FE_TLS" = true ]; then
+  FE_URL="https://$$FE_HOST:$$FE_PORT_TLS"
+else
+  FE_URL="http://$$FE_HOST:$$FE_PORT"
+fi
 TABLAS_EMPLEADOS="users roles user_roles user_profiles user_phones user_addresses user_emails vault_auth_config user_vault_identity vault_operations"
 TABLAS_CATALOGO="secret_collections secret_collection_schemas secret_records secret_consumers secret_consumer_bindings secret_operations secret_audit secret_receivers secret_provisioning_deliveries"
 # Receptores de la etapa 4.6. Su credencial se genera si falta y NO se rota.
@@ -378,6 +404,7 @@ svc_img() {
     postgres-service)   printf '%s' "$$IMG_PG" ;;
     user-mgmt-service)  printf '%s' "$$IMG_UM" ;;
     vault-mgmt-service) printf '%s' "$$IMG_VM" ;;
+    frontend-service)   printf '%s' "$$IMG_FE" ;;
   esac
 }
 svc_base() {
@@ -385,6 +412,8 @@ svc_base() {
     vault-service)      printf '%s' "$$BASE_VAULT" ;;
     postgres-service)   printf '%s' "$$BASE_PG" ;;
     user-mgmt-service|vault-mgmt-service) printf '%s' "$$BASE_PY" ;;
+    # Dos bases: Node para construir el paquete y Nginx para servirlo.
+    frontend-service)   printf '%s %s' "$$BASE_NODE" "$$BASE_NGINX" ;;
   esac
 }
 svc_target() {
@@ -393,6 +422,7 @@ svc_target() {
     postgres-service)   printf 'postgres-server' ;;
     user-mgmt-service)  printf 'user-mgmt-server' ;;
     vault-mgmt-service) printf 'vault-mgmt-server' ;;
+    frontend-service)   printf 'frontend-server' ;;
   esac
 }
 svc_args() {
@@ -400,6 +430,7 @@ svc_args() {
     vault-service)      printf 'VAULT_VERSION=%s' "$$VAULT_VERSION" ;;
     postgres-service)   printf 'POSTGRES_VERSION=%s' "$$POSTGRES_VERSION" ;;
     user-mgmt-service|vault-mgmt-service) printf 'PYTHON_VERSION=%s' "$$PYTHON_VERSION" ;;
+    frontend-service)   printf 'NODE_VERSION=%s NGINX_VERSION=%s' "$$NODE_VERSION" "$$NGINX_VERSION" ;;
   esac
 }
 svc_files() {
@@ -408,6 +439,7 @@ svc_files() {
     postgres-service)   printf '%s' "sql/001_employees.sql scripts/postgres/pg-schema.sh scripts/postgres/pg-app-role.sh" ;;
     user-mgmt-service)  printf '%s' "requirements/user_mgmt.txt" ;;
     vault-mgmt-service) printf '%s' "requirements/vault_mgmt.txt" ;;
+    frontend-service)   printf '%s' "frontend/package.json frontend/package-lock.json frontend/tsconfig.json frontend/vite.config.ts frontend/eslint.config.js frontend/index.html docker/frontend/nginx.conf docker/frontend/entrypoint.sh" ;;
   esac
 }
 svc_arbol() {
@@ -415,6 +447,7 @@ svc_arbol() {
     vault-service)      printf '%s' "config/policies:*.hcl" ;;
     postgres-service)   printf '%s' "" ;;
     user-mgmt-service|vault-mgmt-service) printf '%s' "app:*.py" ;;
+    frontend-service)   printf '%s' "frontend/src:* frontend/public:* docker/frontend/snippets:*.conf docker/frontend/templates:*.template" ;;
   esac
 }
 huella_arbol() {
@@ -859,6 +892,160 @@ dns_interno() {
   fi
   ok "$$svc resuelve por DNS interno: $$nombres"
 }
+# Misma comprobacion para un contenedor que no lleva Python. La imagen del
+# frontend es Nginx: no tiene interprete, y no se le anade uno solo para esto.
+dns_interno_sh() {
+  local svc="$$1" nombres="$$2" salida cuantos esperados
+  salida=$$(dc exec -T "$$svc" sh -c 'for h in $$1; do getent hosts "$$h" || echo "FALLO $$h"; done' sh "$$nombres" 2>&1 | tr -d '\r' || true)
+  cuantos=$$(printf '%s\n' "$$salida" | grep -c '^[0-9a-f:.]\+[[:space:]]' || true)
+  esperados=$$(printf '%s\n' $$nombres | wc -l | tr -d ' ')
+  if [ "$$cuantos" != "$$esperados" ]; then
+    printf '   ...       %s\n' "$$(sanitize "$$salida")" >&2
+    die "$$svc no resuelve por DNS interno todos los nombres de la red $$NET: $$nombres"
+  fi
+  ok "$$svc resuelve por DNS interno: $$nombres"
+}
+
+# ---- etapa 5.1: frontend ---------------------------------------------------
+# El par TLS tiene que EXISTIR para que 'docker compose config' valide, porque
+# los dos archivos se declaran como Compose secrets. Se crean VACIOS si faltan,
+# y vacio significa "TLS sin preparar": el arranque del contenedor rechaza el
+# modo HTTPS con material vacio y dice por que. Aqui no se genera ningun
+# certificado: eso lo hace scripts/frontend/prepare-tls.sh, a peticion.
+preparar_tls_frontend() {
+  local ruta archivo
+  for ruta in "$$FE_CERT" "$$FE_KEY"; do
+    archivo="$$ROOT/$${ruta#./}"
+    mkdir -p "$$(dirname "$$archivo")" || die "no se puede crear el directorio de $$ruta"
+    chmod 700 "$$(dirname "$$archivo")" 2>/dev/null || true
+    if [ ! -e "$$archivo" ]; then
+      : > "$$archivo" || die "no se puede crear $$ruta"
+      chmod 600 "$$archivo" 2>/dev/null || true
+    fi
+  done
+  if [ -s "$$ROOT/$${FE_CERT#./}" ]; then
+    skip "material TLS del frontend: ya existe en $$FE_CERT (no se rota ni se regenera)"
+  else
+    skip "material TLS del frontend: marcadores vacios en secrets/frontend-tls/ (el modo HTTP no los abre)"
+  fi
+}
+
+# Valida alcance, bind, puertos y TLS ANTES de publicar nada. Esta validacion
+# esta duplicada a proposito con la del entrypoint del contenedor: aqui se lee
+# en la salida de make y antes de levantar el servicio, y alli protege tambien
+# a quien arranque el contenedor sin pasar por este Makefile.
+validar_frontend() {
+  local fe_loopback nombre nombres cubierto cert clave h_cert h_clave caduca
+  case "$$FE_ALCANCE" in
+    local|lan) ;;
+    *) die "FRONTEND_ACCESS_SCOPE debe valer 'local' o 'lan' (hay '$$FE_ALCANCE')" ;;
+  esac
+  case "$$FE_TLS" in
+    true|false) ;;
+    *) die "FRONTEND_HTTPS_ENABLED debe valer 'true' o 'false' (hay '$$FE_TLS')" ;;
+  esac
+  case "$$FE_PORT" in ''|*[!0-9]*) die "FRONTEND_HTTP_PORT no es un puerto: '$$FE_PORT'" ;; esac
+  case "$$FE_PORT_TLS" in ''|*[!0-9]*) die "FRONTEND_HTTPS_PORT no es un puerto: '$$FE_PORT_TLS'" ;; esac
+  [ "$$FE_PORT" -ge 1024 ] && [ "$$FE_PORT_TLS" -ge 1024 ] ||
+    die "los puertos del frontend deben ser no privilegiados (1024 o mayor): HTTP $$FE_PORT, HTTPS $$FE_PORT_TLS"
+  [ "$$FE_PORT" != "$$FE_PORT_TLS" ] ||
+    die "FRONTEND_HTTP_PORT y FRONTEND_HTTPS_PORT no pueden ser el mismo puerto"
+  case "$$FE_HOST" in
+    ''|*://*|*/*) die "FRONTEND_PUBLIC_HOST debe ser solo un nombre o una IP, sin esquema ni ruta (hay '$$FE_HOST')" ;;
+  esac
+
+  if [ "$$FE_ALCANCE" = lan ] && [ "$$FE_TLS" != true ]; then
+    printf '             Prepara el certificado:  bash scripts/frontend/prepare-tls.sh\n' >&2
+    printf '             y pon FRONTEND_HTTPS_ENABLED=true en .env\n' >&2
+    die "alcance 'lan' exige HTTPS habilitado. Publicar el login del despacho en texto claro expondria la contrasena y el codigo TOTP de cada persona"
+  fi
+  case "$$FE_BIND" in
+    127.0.0.1|::1|localhost) fe_loopback=si ;;
+    *) fe_loopback=no ;;
+  esac
+  if [ "$$FE_ALCANCE" = local ] && [ "$$FE_TLS" != true ] && [ "$$fe_loopback" = no ]; then
+    die "alcance 'local' sin HTTPS solo admite publicacion en loopback, y FRONTEND_HOST_BIND es '$$FE_BIND'. Cambiar solo el bind no elude el requisito: usa FRONTEND_ACCESS_SCOPE=lan con TLS"
+  fi
+  ok "frontend: alcance '$$FE_ALCANCE', HTTPS $$FE_TLS, bind $$FE_BIND y puertos $$FE_PORT/$$FE_PORT_TLS son una combinacion admitida"
+
+  if [ "$$FE_TLS" != true ]; then
+    return 0
+  fi
+
+  cert="$$ROOT/$${FE_CERT#./}"
+  clave="$$ROOT/$${FE_KEY#./}"
+  [ -s "$$cert" ] ||
+    die "FRONTEND_HTTPS_ENABLED=true pero $$FE_CERT esta vacio o no existe. Genera el par con 'bash scripts/frontend/prepare-tls.sh'. No se vuelve a HTTP por cuenta propia: eso serviria el login en claro sin avisar"
+  [ -s "$$clave" ] ||
+    die "FRONTEND_HTTPS_ENABLED=true pero la clave TLS esta vacia o no existe. Genera el par con 'bash scripts/frontend/prepare-tls.sh'"
+  [ -r "$$cert" ] && [ -r "$$clave" ] ||
+    die "el par TLS existe pero no es legible: revisa los permisos de secrets/frontend-tls/"
+
+  if ! command -v openssl >/dev/null 2>&1; then
+    info "sin openssl en el host: la vigencia, la correspondencia y los nombres del certificado los comprueba el contenedor al arrancar, y si fallan este paso aborta con el motivo"
+    return 0
+  fi
+  openssl x509 -in "$$cert" -noout >/dev/null 2>&1 || die "$$FE_CERT no es un PEM X.509 valido"
+  openssl pkey -in "$$clave" -noout >/dev/null 2>&1 || die "la clave TLS no es un PEM valido"
+  openssl x509 -in "$$cert" -noout -checkend 0 >/dev/null 2>&1 ||
+    die "el certificado de $$FE_CERT esta caducado. Renuevalo con 'bash scripts/frontend/prepare-tls.sh --force': no se publica TLS con un certificado invalido"
+  h_cert=$$(openssl x509 -in "$$cert" -noout -pubkey 2>/dev/null | openssl sha256 | awk '{print $$NF}')
+  h_clave=$$(openssl pkey -in "$$clave" -pubout 2>/dev/null | openssl sha256 | awk '{print $$NF}')
+  [ -n "$$h_cert" ] && [ "$$h_cert" = "$$h_clave" ] ||
+    die "el certificado y la clave no se corresponden. Comprueba que FRONTEND_TLS_CERT_FILE y FRONTEND_TLS_KEY_FILE apuntan al MISMO par"
+  nombres=$$(openssl x509 -in "$$cert" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' |
+             sed -n 's/^[[:space:]]*DNS://p; s/^[[:space:]]*IP Address://p' | tr -d ' ')
+  cubierto=no
+  for nombre in $$nombres; do
+    if [ "$$nombre" = "$$FE_HOST" ]; then cubierto=si; break; fi
+  done
+  [ "$$cubierto" = si ] ||
+    die "el certificado no cubre '$$FE_HOST' (cubre: $${nombres:-ninguno: no tiene subjectAltName}). Reemitelo con ese nombre: bash scripts/frontend/prepare-tls.sh --force $$FE_HOST"
+  caduca=$$(openssl x509 -in "$$cert" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+  ok "frontend: certificado valido, con su clave, cubriendo '$$FE_HOST' y vigente hasta $$caduca"
+}
+
+# Espera a que el frontend este sano. El healthcheck del contenedor va por su
+# escucha interna de HTTP, asi que sirve igual en los dos modos y no necesita
+# ninguna comprobacion insegura de TLS.
+esperar_frontend() {
+  local secs="$$1" deadline estado code cid
+  deadline=$$(( $$(date +%s) + secs ))
+  while :; do
+    cid=$$(dc ps -q frontend-service 2>/dev/null | tr -d '\r' | head -n 1)
+    estado=$$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}sin-healthcheck{{end}}' "$$cid" 2>/dev/null | tr -d '\r' || true)
+    if [ "$$estado" = healthy ]; then break; fi
+    if ! contenedor_vivo frontend-service; then
+      printf '   ...       ultimas lineas de frontend-service:\n' >&2
+      dc logs --tail 20 frontend-service 2>&1 | cut -c1-200 | sed 's/^/             /' >&2 || true
+      die "el contenedor del frontend no esta en marcha: su arranque termino. Si fue la validacion de TLS o del alcance, el log de arriba lo dice literalmente"
+    fi
+    if [ "$$(date +%s)" -ge "$$deadline" ]; then
+      dc logs --tail 20 frontend-service 2>&1 | cut -c1-200 | sed 's/^/             /' >&2 || true
+      die "frontend-service no llego a 'healthy' en $${secs}s (ultimo estado: $${estado:-desconocido})"
+    fi
+    latir
+    sleep 3
+  done
+  ok "frontend-service healthy: su escucha interna de salud responde, y no finge la de user-mgmt"
+
+  if [ "$$FE_TLS" = true ]; then
+    if (exec 3<>/dev/tcp/"$$FE_BIND"/"$$FE_PORT_TLS") 2>/dev/null; then
+      ok "puerto TLS $$FE_BIND:$$FE_PORT_TLS publicado y aceptando conexiones"
+    else
+      anotar_fallo "el puerto TLS $$FE_BIND:$$FE_PORT_TLS no acepta conexiones desde el host"
+    fi
+    info "aqui no se valida el certificado: hacerlo con -k no acreditaria nada. La comprobacion real es 'bash scripts/frontend/check-headers.sh --cacert <rootCA.pem>'"
+  else
+    code=$$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "http://$$FE_BIND:$$FE_PORT/healthz" 2>/dev/null || printf '000')
+    [ "$$code" = "200" ] ||
+      die "el contenedor esta healthy pero http://$$FE_BIND:$$FE_PORT/healthz responde $$code desde el host: revisa la publicacion del puerto"
+    ok "frontend publicado en http://$$FE_BIND:$$FE_PORT (/healthz responde 200)"
+    code=$$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "http://$$FE_BIND:$$FE_PORT/configuracion-totp" 2>/dev/null || printf '000')
+    [ "$$code" = "200" ] ||
+      anotar_fallo "una ruta profunda de la interfaz responde $$code: el fallback de la SPA no esta sirviendo index.html"
+  fi
+}
 
 # ---- purge: inventario y borrado acreditado --------------------------------
 inventariar() {
@@ -1020,6 +1207,12 @@ retirar_credenciales_desechables() {
     esac
     borrar_secreto_generado "$$nombre"
   done
+  # El material TLS del frontend NO esta en la lista de arriba a proposito: no
+  # depende de ningun volumen y perderlo obligaria a volver a instalar la
+  # confianza de su CA en todos los equipos del despacho.
+  if [ -s "$$ROOT/$${FE_CERT#./}" ]; then
+    info "secrets/frontend-tls/ se conserva: el certificado del frontend no depende de ningun volumen, y borrarlo obligaria a reinstalar su confianza en cada equipo"
+  fi
   info "se conservan .env, el codigo, la configuracion y cualquier otro archivo de secrets/ que no genere este proyecto"
 }
 invalidar_estado_local() {
@@ -1078,7 +1271,8 @@ CARGA = TARGET_NAME='$@'; RUN_ID='$(RUN_ID)'; . "$(COMUN)"
 
 PASOS := .paso-01-validar .paso-02-imagenes .paso-03-arranque .paso-04-postgres \
          .paso-05-vault .paso-06-migraciones .paso-07-administrador \
-         .paso-08-credenciales .paso-09-apis .paso-10-resumen
+         .paso-08-credenciales .paso-09-apis .paso-10-frontend \
+         .paso-11-resumen
 
 .PHONY: all help config down purge $(PASOS)
 
@@ -1115,7 +1309,15 @@ help:
 	@printf 'Recorridos interactivos (no forman parte del arranque):\n'
 	@printf '  bash scripts/vault_mgmt/walkthrough.sh              CRUD de secretos, pide TOTP\n'
 	@printf '  bash scripts/vault_mgmt/provisioning-walkthrough.sh aprovisionamiento 4.6\n'
-	@printf '  bash scripts/postgres/verify-vault-mfa.sh           login userpass + TOTP real\n\n'
+	@printf '  bash scripts/postgres/verify-vault-mfa.sh           login userpass + TOTP real\n'
+	@printf '  bash scripts/frontend/smoke-frontend.sh             recorrido del frontend\n'
+	@printf '  bash scripts/frontend/check-headers.sh              cabeceras, CSP y TLS\n'
+	@printf '  bash scripts/frontend/run-tests.sh                  tipos, lint y pruebas (Docker)\n'
+	@printf '  bash scripts/frontend/dev.sh                        perfil de desarrollo con HMR\n\n'
+	@printf 'Frontend (etapa 5.1): se levanta dentro de make all. HTTP solo en loopback;\n'
+	@printf 'para compartirlo en el despacho hace falta HTTPS:\n'
+	@printf '  bash scripts/frontend/prepare-tls.sh <nombre o IP>\n'
+	@printf '  y en .env: FRONTEND_HTTPS_ENABLED=true  FRONTEND_ACCESS_SCOPE=lan\n\n'
 
 # =============================================================================
 # make config - paso previo: credenciales de Vault en archivos del proyecto
@@ -1193,7 +1395,7 @@ all: $(PASOS)
 	tomar_bloqueo
 	: > "$$RESUMEN"
 	printf '== VPG Contadores: make all (proyecto %s)\n' "$$PROJECT_NAME"
-	step "1/10 Herramientas, conexion con Docker, archivos, secretos y puertos"
+	step "1/11 Herramientas, conexion con Docker, archivos, secretos y puertos"
 	[ "$${BASH_VERSINFO[0]:-0}" -ge 4 ] || die "se necesita Bash 4 o posterior (Git Bash / MSYS2 lo trae)"
 	for util in sed grep awk tr cut sort find head tail wc date sleep stat touch mkdir rmdir rm cat sha256sum curl timeout; do
 	  need_tool "$$util" "Lo aportan Git for Windows / MSYS2 (coreutils). No se instala nada automaticamente."
@@ -1211,13 +1413,25 @@ all: $(PASOS)
 	         scripts/postgres/pg-app-role.sh scripts/postgres/seed-initial-user.sh \
 	         scripts/user_mgmt/apply-migrations.sh scripts/user_mgmt/vault-approle-bootstrap.sh \
 	         scripts/vault_mgmt/apply-migrations.sh scripts/vault_mgmt/prepare-internal-secret.sh \
-	         requirements/user_mgmt.txt requirements/vault_mgmt.txt; do
+	         requirements/user_mgmt.txt requirements/vault_mgmt.txt \
+	         frontend/package.json frontend/package-lock.json frontend/index.html \
+	         frontend/tsconfig.json frontend/vite.config.ts frontend/eslint.config.js \
+	         docker/frontend/nginx.conf docker/frontend/entrypoint.sh \
+	         docker/frontend/snippets/app.conf \
+	         docker/frontend/snippets/security-headers.conf \
+	         docker/frontend/templates/server-http.conf.template \
+	         docker/frontend/templates/server-https.conf.template; do
 	  require_file "$$f"
 	done
 	[ -d "$$ROOT/config/policies" ] || die "falta el directorio config/policies"
 	[ -n "$$(find "$$ROOT/config/policies" -name '*.hcl' -print -quit)" ] || die "config/policies no contiene politicas .hcl"
 	[ -d "$$ROOT/app" ] || die "falta el arbol de aplicacion app/"
+	[ -d "$$ROOT/frontend/src" ] || die "falta el arbol del frontend frontend/src"
 	ok "archivos, migraciones, politicas y scripts referenciados presentes"
+	# El par TLS se deja EXISTIENDO (aunque vacio) antes de validar la
+	# configuracion: los dos archivos se declaran como Compose secrets y
+	# 'docker compose config' falla si alguno no existe.
+	preparar_tls_frontend
 	errores="$$STATE_DIR/compose-config.err"
 	if ! dc config --quiet 2>"$$errores"; then
 	  if [ -s "$$errores" ]; then printf '   ...       %s\n' "$$(sanitize "$$(head -c 500 "$$errores")")" >&2; fi
@@ -1227,11 +1441,11 @@ all: $(PASOS)
 	rm -f "$$errores"
 	ok "compose.yaml valido (validado sin volcar la configuracion expandida)"
 	declaradas=$$(dc config --images 2>/dev/null | tr -d '\r')
-	for img in "$$IMG_VAULT" "$$IMG_PG" "$$IMG_UM" "$$IMG_VM"; do
+	for img in "$$IMG_VAULT" "$$IMG_PG" "$$IMG_UM" "$$IMG_VM" "$$IMG_FE"; do
 	  printf '%s\n' "$$declaradas" | grep -Fxq "$$img" ||
 	    die "compose.yaml no declara la imagen $$img; comprueba las versiones de .env"
 	done
-	ok "las cuatro imagenes del proyecto coinciden con lo declarado en compose.yaml"
+	ok "las cinco imagenes del proyecto coinciden con lo declarado en compose.yaml"
 	if [ ! -s secrets/postgres_password ]; then
 	  if docker volume inspect "$$VOL_PG" >/dev/null 2>&1; then
 	    die "falta secrets/postgres_password y el volumen $$VOL_PG ya existe: initdb fijo esa contrasena en la primera inicializacion y generar otra NO la cambia. Recupera el archivo de tu gestor de contrasenas, o empieza de cero con 'make purge' (borra los datos)"
@@ -1251,21 +1465,29 @@ all: $(PASOS)
 	puerto_libre "$$PG_BIND"    "$$PG_PORT"    postgres-service
 	puerto_libre "$$UM_BIND"    "$$UM_PORT"    user-mgmt-service
 	puerto_libre "$$VM_BIND"    "$$VM_PORT"    vault-mgmt-service
-	ok "puertos $$VAULT_PORT, $$PG_PORT, $$UM_PORT y $$VM_PORT sin colisiones"
+	puerto_libre "$$FE_BIND"    "$$FE_PORT"     frontend-service
+	# El puerto TLS se publica en los dos modos (Compose no admite mapeos
+	# condicionales), asi que su colision se comprueba siempre.
+	puerto_libre "$$FE_BIND"    "$$FE_PORT_TLS" "frontend-service (TLS)"
+	ok "puertos $$VAULT_PORT, $$PG_PORT, $$UM_PORT, $$VM_PORT, $$FE_PORT y $$FE_PORT_TLS sin colisiones"
+	# Alcance, bind y TLS se validan ya aqui: si la combinacion no es admitida,
+	# es mejor saberlo antes de construir imagenes que al publicar un puerto.
+	validar_frontend
 
 # --- 2. Imagenes: base solo si falta, build solo si cambian las entradas ------
 .paso-02-imagenes:
 	@$(CARGA)
 	tomar_bloqueo
-	step "2/10 Imagenes: base solo si falta, build solo si cambiaron sus entradas"
+	step "2/11 Imagenes: base solo si falta, build solo si cambiaron sus entradas"
 	docker_vivo
-	resolver_imagenes vault-service postgres-service user-mgmt-service vault-mgmt-service
+	resolver_imagenes vault-service postgres-service user-mgmt-service vault-mgmt-service \
+	  frontend-service
 
 # --- 3. PostgreSQL y Vault, sin levantar todavia las APIs --------------------
 .paso-03-arranque:
 	@$(CARGA)
 	tomar_bloqueo
-	step "3/10 PostgreSQL y Vault (todavia sin las APIs)"
+	step "3/11 PostgreSQL y Vault (todavia sin las APIs)"
 	docker_vivo
 	act "docker compose up -d --no-build postgres-service vault-service"
 	dc up -d --no-build postgres-service vault-service ||
@@ -1283,14 +1505,14 @@ all: $(PASOS)
 .paso-04-postgres:
 	@$(CARGA)
 	tomar_bloqueo
-	step "4/10 PostgreSQL listo: healthy, pg_isready y SELECT 1 autenticado"
+	step "4/11 PostgreSQL listo: healthy, pg_isready y SELECT 1 autenticado"
 	esperar_pg $(PG_TIMEOUT)
 
 # --- 5. Vault: estados distinguidos y unseal manual --------------------------
 .paso-05-vault:
 	@$(CARGA)
 	tomar_bloqueo
-	step "5/10 Vault: accesible, inicializado y desbloqueado"
+	step "5/11 Vault: accesible, inicializado y desbloqueado"
 	esperar_vault_accesible $(VAULT_TIMEOUT)
 	# Etapa 4.6: 'make all' SI inicializa, pero SOLO un volumen nuevo.
 	#
@@ -1351,7 +1573,7 @@ all: $(PASOS)
 .paso-06-migraciones:
 	@$(CARGA)
 	tomar_bloqueo
-	step "6/10 Migraciones pendientes, permisos y objetos del catalogo"
+	step "6/11 Migraciones pendientes, permisos y objetos del catalogo"
 	info "este proyecto no tiene tabla de historial ni checksums de migraciones (lo dice su README): no se puede saber por historial que se aplico, asi que se comprueban OBJETOS e INVARIANTES y solo se actua si falta algo. No se emite DDL en cada arranque ni se usa create_all"
 	faltan=$$(tablas_faltantes "$$PG_SCHEMA" "$$TABLAS_EMPLEADOS")
 	rol_app=$$(sql1 "SELECT count(*) FROM pg_roles WHERE rolname = '$$PG_APP';")
@@ -1385,7 +1607,7 @@ all: $(PASOS)
 .paso-07-administrador:
 	@$(CARGA)
 	tomar_bloqueo
-	step "7/10 Administrador en PostgreSQL y en Vault, antes de iniciar las APIs"
+	step "7/11 Administrador en PostgreSQL y en Vault, antes de iniciar las APIs"
 	JOIN="FROM $$PG_SCHEMA.users u JOIN $$PG_SCHEMA.user_roles ur ON ur.user_id = u.id JOIN $$PG_SCHEMA.roles r ON r.id = ur.role_id AND r.code = 'admin' JOIN $$PG_SCHEMA.user_vault_identity vi ON vi.user_id = u.id JOIN $$PG_SCHEMA.vault_auth_config c ON c.id = vi.vault_auth_config_id WHERE u.is_active"
 	cuantos=$$(sql1 "SELECT count(*) $$JOIN;")
 	case "$${cuantos:-}" in
@@ -1441,7 +1663,7 @@ all: $(PASOS)
 .paso-08-credenciales:
 	@$(CARGA)
 	tomar_bloqueo
-	step "8/10 Configuracion tecnica: AppRole de user-mgmt y credencial de la pasarela"
+	step "8/11 Configuracion tecnica: AppRole de user-mgmt y credencial de la pasarela"
 	if [ -s secrets/vault_role_id ] && [ -s secrets/vault_secret_id ]; then
 	  skip "AppRole de user-mgmt: role_id y secret_id ya presentes (no se regenera un SecretID valido)"
 	else
@@ -1472,7 +1694,7 @@ all: $(PASOS)
 .paso-09-apis:
 	@$(CARGA)
 	tomar_bloqueo
-	step "9/10 APIs en orden y worker de aprovisionamiento"
+	step "9/11 APIs en orden y worker de aprovisionamiento"
 	docker_vivo
 	act "docker compose up -d --no-build user-mgmt-service"
 	dc up -d --no-build user-mgmt-service || die "Compose no pudo arrancar user-mgmt-service"
@@ -1500,12 +1722,33 @@ all: $(PASOS)
 	    anotar_fallo "vault-mgmt-worker no esta running (estado: $${worker_estado:-desconocido}). Las solicitudes de consumidor se guardaran y quedaran en pending. Log: docker compose logs vault-mgmt-worker" ;;
 	esac
 
-# --- 10. Resumen y liberacion del bloqueo -----------------------------------
-.paso-10-resumen:
+# --- 10. Frontend: validar, publicar y comprobar ----------------------------
+#
+# Va DESPUES de las APIs a proposito: el frontend no aporta nada si la pasarela
+# no tiene a donde reenviar, y asi el 503 que vea el navegador viene de un
+# backend que ya se sabe en que estado esta.
+#
+# Lo que NO hace: no desbloquea Vault (eso es del paso 5), no toca MFA, no
+# resetea nada y no construye si no cambiaron las entradas del build.
+.paso-10-frontend:
+	@$(CARGA)
+	tomar_bloqueo
+	step "10/11 Frontend: alcance, TLS, publicacion y salud"
+	docker_vivo
+	validar_frontend
+	resolver_imagenes frontend-service
+	act "docker compose up -d --no-build frontend-service"
+	dc up -d --no-build frontend-service || die "Compose no pudo arrancar frontend-service"
+	esperar_frontend $(API_TIMEOUT)
+	dns_interno_sh frontend-service "user-mgmt-service"
+	info "el navegador llama al MISMO origen: /api/user_mgmt/v1/... lo reenvia Nginx a user-mgmt-service:$$(env_req USER_MGMT_PORT_REMOTE). Ni Vault ni PostgreSQL ni /internal se publican"
+
+# --- 11. Resumen y liberacion del bloqueo -----------------------------------
+.paso-11-resumen:
 	@$(CARGA)
 	tomar_bloqueo
 	LIBERAR_AL_SALIR=1
-	step "10/10 Resumen"
+	step "11/11 Resumen"
 	dc ps --format "table {{.Service}}\t{{.Name}}\t{{.Status}}" 2>/dev/null | sed 's/^/   /' || true
 	printf '\n   Puertos publicados en el host (lo que declara .env):\n'
 	printf '     vault-service ......: %s:%s        UI   http://%s:%s/ui\n' "$$VAULT_BIND" "$$VAULT_PORT" "$$VAULT_BIND" "$$VAULT_PORT"
@@ -1513,6 +1756,12 @@ all: $(PASOS)
 	printf '     user-mgmt-service ..: %s:%s        docs %s/docs\n' "$$UM_BIND" "$$UM_PORT" "$$UM_URL"
 	printf '     vault-mgmt-service .: %s:%s        docs %s/docs   redoc %s/redoc\n' "$$VM_BIND" "$$VM_PORT" "$$VM_URL" "$$VM_URL"
 	printf '     vault-mgmt-worker ..: sin puerto; procesa la cola de operaciones\n'
+	if [ "$$FE_TLS" = true ]; then
+	  printf '     frontend-service ...: %s:%s (TLS)  %s\n' "$$FE_BIND" "$$FE_PORT_TLS" "$$FE_URL"
+	  printf '                           el puerto %s solo redirige al origen HTTPS\n' "$$FE_PORT"
+	else
+	  printf '     frontend-service ...: %s:%s        %s\n' "$$FE_BIND" "$$FE_PORT" "$$FE_URL"
+	fi
 	printf '\n   Comprobaciones de esta ejecucion:\n'
 	if [ -s "$$RESUMEN" ]; then sed 's/^/     - /' "$$RESUMEN"; else printf '     (sin registro)\n'; fi
 	printf '\n   Recordatorios:\n'
@@ -1525,10 +1774,24 @@ all: $(PASOS)
 	  printf '       dejarlo desatendido con  make config.\n'
 	fi
 	printf '     * make down conserva volumenes, imagenes y secretos; make purge los borra.\n'
+	printf '     * El frontend se abre en %s. La sesion vive en memoria: al recargar\n' "$$FE_URL"
+	printf '       la pagina hay que iniciar sesion otra vez, y eso es lo correcto aqui.\n'
+	if [ "$$FE_TLS" = true ]; then
+	  printf '     * HTTPS activo. Cada equipo del despacho tiene que confiar en la CA del\n'
+	  printf '       certificado a mano: ningun script de este repositorio toca otro equipo.\n'
+	  printf '       Comprobacion con validacion real del certificado:\n'
+	  printf '         bash scripts/frontend/check-headers.sh --cacert <rootCA.pem>\n'
+	else
+	  printf '     * Modo HTTP y solo en loopback. Para compartirlo en el despacho:\n'
+	  printf '         bash scripts/frontend/prepare-tls.sh <nombre o IP>\n'
+	  printf '         y en .env: FRONTEND_HTTPS_ENABLED=true, FRONTEND_ACCESS_SCOPE=lan\n'
+	fi
 	printf '     * Los recorridos interactivos no son parte del arranque:\n'
 	printf '         bash scripts/vault_mgmt/walkthrough.sh      (CRUD de secretos, pide TOTP)\n'
 	printf '         bash scripts/vault_mgmt/provisioning-walkthrough.sh  (alta y aprovisionamiento 4.6)\n'
 	printf '         bash scripts/postgres/verify-vault-mfa.sh   (login userpass + TOTP real)\n'
+	printf '         bash scripts/frontend/smoke-frontend.sh     (recorrido del frontend)\n'
+	printf '         bash scripts/frontend/check-headers.sh      (cabeceras y CSP)\n'
 
 # =============================================================================
 # make down - detener conservando los datos

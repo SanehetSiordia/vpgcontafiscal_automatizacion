@@ -121,6 +121,35 @@ class MfaProof:
 
 
 @dataclass(slots=True)
+class EnrollmentGrant:
+    """Autorizacion breve para que alguien inscriba **su propio** TOTP.
+
+    Se emite en el paso 1 del login, despues de que Vault valide la contrasena
+    y de comprobar el vinculo del empleado en PostgreSQL. Tres cosas que NO es:
+
+    * no es una sesion: no lleva token de Vault, no autoriza ninguna operacion
+      de negocio y no sirve como ``Authorization: Bearer``;
+    * no es un permiso sobre otra persona: lleva dentro el usuario y la entidad,
+      que salen del vinculo registrado y nunca del cuerpo de la peticion;
+    * no es reutilizable: se consume en el primer uso, igual que un desafio.
+
+    Que exista tampoco decide que haya semilla que generar: eso lo decide Vault,
+    que rechaza un ``admin-generate`` sobre una entidad que ya tiene una.
+    """
+
+    grant_id: str = field(repr=False)
+    user_id: uuid.UUID
+    username: str
+    entity_id: str
+    totp_status: str
+    expires_at: dt.datetime
+
+    @property
+    def expired(self) -> bool:
+        return _now() >= self.expires_at
+
+
+@dataclass(slots=True)
 class ApiSession:
     """Sesion API viva. Guarda el token de Vault, que jamas se devuelve."""
 
@@ -166,6 +195,9 @@ class SessionStore:
         self._challenges: dict[str, PendingChallenge] = {}
         self._step_ups: dict[str, StepUpChallenge] = {}
         self._proofs: dict[str, MfaProof] = {}
+        # Autorizaciones de inscripcion inicial del propio TOTP (etapa 5.1).
+        # Comparten TTL y tope con los desafios: son igual de efimeras.
+        self._enrollments: dict[str, EnrollmentGrant] = {}
         self._lock = asyncio.Lock()
 
     # -- desafios ------------------------------------------------------------
@@ -204,6 +236,41 @@ class SessionStore:
             if challenge is None or challenge.expired:
                 return None
             return challenge
+
+    # -- inscripcion inicial del propio TOTP (etapa 5.1) ---------------------
+
+    async def create_enrollment(
+        self,
+        *,
+        user_id: uuid.UUID,
+        username: str,
+        entity_id: str,
+        totp_status: str,
+    ) -> EnrollmentGrant:
+        async with self._lock:
+            self._purge_locked()
+            if len(self._enrollments) >= self._max_challenges:
+                oldest = min(self._enrollments.values(), key=lambda g: g.expires_at)
+                self._enrollments.pop(oldest.grant_id, None)
+
+            grant = EnrollmentGrant(
+                grant_id=secrets.token_urlsafe(24),
+                user_id=user_id,
+                username=username,
+                entity_id=entity_id,
+                totp_status=totp_status,
+                expires_at=_now() + dt.timedelta(seconds=self._challenge_ttl),
+            )
+            self._enrollments[grant.grant_id] = grant
+            return grant
+
+    async def pop_enrollment(self, grant_id: str) -> EnrollmentGrant | None:
+        """Saca la autorizacion del almacen: es de un solo uso."""
+        async with self._lock:
+            grant = self._enrollments.pop(grant_id, None)
+            if grant is None or grant.expired:
+                return None
+            return grant
 
     # -- sesiones ------------------------------------------------------------
 
@@ -281,6 +348,11 @@ class SessionStore:
             for key, step_up in list(self._step_ups.items()):
                 if step_up.user_id == user_id:
                     self._step_ups.pop(key, None)
+            # Una autorizacion de inscripcion tampoco sobrevive a un reset ni a
+            # una baja: se emitio para un estado que ya no es el actual.
+            for key, grant in list(self._enrollments.items()):
+                if grant.user_id == user_id:
+                    self._enrollments.pop(key, None)
             return victims
 
     # -- reautenticacion para operaciones destructivas -----------------------
@@ -379,6 +451,9 @@ class SessionStore:
         for key, proof in list(self._proofs.items()):
             if proof.expired:
                 self._proofs.pop(key, None)
+        for key, grant in list(self._enrollments.items()):
+            if grant.expired:
+                self._enrollments.pop(key, None)
 
     async def purge(self) -> None:
         async with self._lock:
@@ -391,6 +466,7 @@ class SessionStore:
                 "challenges": len(self._challenges),
                 "step_ups": len(self._step_ups),
                 "mfa_proofs": len(self._proofs),
+                "enrollment_grants": len(self._enrollments),
             }
 
     async def all_sessions(self) -> list[ApiSession]:
@@ -404,4 +480,5 @@ class SessionStore:
             self._challenges.clear()
             self._step_ups.clear()
             self._proofs.clear()
+            self._enrollments.clear()
             return victims

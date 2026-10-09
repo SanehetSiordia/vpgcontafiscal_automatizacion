@@ -270,6 +270,31 @@ async def touch_mfa_login(
     return True
 
 
+async def touch_totp_generated(
+    session: AsyncSession, *, user_id: uuid.UUID, entity_id: uuid.UUID, now: dt.datetime
+) -> bool:
+    """Anota que se genero una semilla para esa entidad. **No** confirma nada.
+
+    El estado se deja como estaba: ``pending`` sigue siendo ``pending`` y
+    ``reset_required`` sigue siendo ``reset_required``. Lo unico que confirma un
+    enrolamiento es un login MFA correcto (``touch_mfa_login``).
+    """
+    identity = (
+        await session.execute(
+            select(UserVaultIdentity).where(
+                UserVaultIdentity.user_id == user_id,
+                UserVaultIdentity.vault_entity_id == entity_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if identity is None:
+        return False
+
+    identity.totp_generated_at = now
+    await session.flush()
+    return True
+
+
 async def delete_user(session: AsyncSession, user_id: uuid.UUID) -> None:
     """Borra el agregado. Las FK ON DELETE CASCADE hacen el resto."""
     await session.execute(delete(UserRole).where(UserRole.user_id == user_id))

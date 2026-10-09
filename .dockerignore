@@ -16,6 +16,24 @@
 !requirements/vault_mgmt.txt
 !requirements/vault_mgmt-dev.txt
 
+# Etapa 5.1: frontend y configuracion de Nginx. Se listan los archivos del
+# build, NO node_modules ni dist: el contenedor instala desde el lockfile y
+# construye dentro, para que la imagen no dependa de lo que haya en el equipo.
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
+!frontend/vite.config.ts
+!frontend/eslint.config.js
+!frontend/index.html
+!frontend/src/**
+!frontend/public/**
+!docker/frontend/**
+frontend/node_modules
+frontend/node_modules/**
+frontend/dist
+frontend/dist/**
+frontend/coverage/**
+
 # Explícito, aunque ya queda excluido por la regla anterior.
 .env
 .env.*

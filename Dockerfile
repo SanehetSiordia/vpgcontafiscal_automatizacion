@@ -1,6 +1,8 @@
 ARG VAULT_VERSION=2.1.1
 ARG POSTGRES_VERSION=17-alpine
 ARG PYTHON_VERSION=3.12-alpine
+ARG NODE_VERSION=22-alpine
+ARG NGINX_VERSION=1.27-alpine
 
 # =============================================================================
 # Componente 1: HashiCorp Vault
@@ -176,3 +178,73 @@ COPY --chown=vpg:vpg pytest.ini /app/pytest.ini
 RUN find /app/tests -name '*.py' -exec sed -i 's/\r$//' {} +
 USER vpg
 CMD ["python", "-m", "pytest", "tests/vault_mgmt"]
+
+# =============================================================================
+# Componente 5: frontend-service (React + TypeScript servido por Nginx)
+#
+# Build en dos etapas con proposito distinto:
+#   * `frontend-builder` tiene Node y TODAS las dependencias de desarrollo. Ahi
+#     se comprueban los tipos y se construye el paquete estatico.
+#   * `frontend-server` es Nginx con los estaticos ya construidos. NO lleva
+#     Node, ni npm, ni node_modules, ni el codigo fuente: lo que se publica es
+#     el resultado del build, no las herramientas que lo hicieron.
+# =============================================================================
+
+FROM node:${NODE_VERSION} AS frontend-builder
+WORKDIR /build
+# Primero el manifiesto y el lockfile: asi la capa de dependencias se reutiliza
+# mientras no cambien, aunque cambie el codigo.
+COPY frontend/package.json frontend/package-lock.json ./
+# `npm ci` y no `npm install`: instala EXACTAMENTE el lockfile y falla si el
+# manifiesto y el lockfile no concuerdan.
+RUN npm ci --no-audit --no-fund
+COPY frontend/tsconfig.json frontend/vite.config.ts frontend/eslint.config.js \
+     frontend/index.html ./
+COPY frontend/src ./src
+COPY frontend/public ./public
+# Los tipos se comprueban DENTRO del build: un error de tipos no debe llegar a
+# una imagen publicable.
+RUN npm run typecheck && npm run build
+
+# Etapa de PRUEBAS del frontend. No se publica; se construye a demanda con
+# `--target frontend-test` (scripts/frontend/run-tests.sh).
+FROM frontend-builder AS frontend-test
+ENV CI=true
+CMD ["npm", "test"]
+
+# Etapa final: Nginx con usuario no root, puertos no privilegiados y la
+# configuracion generada en el arranque segun el modo (HTTP o HTTPS).
+FROM nginx:${NGINX_VERSION} AS frontend-server
+# openssl para comprobar de verdad el par certificado/clave antes de publicar
+# TLS; gettext para `envsubst`, que rellena la plantilla del servidor.
+RUN apk add --no-cache openssl gettext
+
+COPY docker/frontend/nginx.conf            /etc/nginx/nginx.conf
+COPY docker/frontend/snippets/             /etc/nginx/vpg/snippets/
+COPY docker/frontend/templates/            /etc/nginx/vpg/templates/
+COPY docker/frontend/entrypoint.sh         /usr/local/bin/vpg-frontend-entrypoint.sh
+COPY --from=frontend-builder /build/dist/  /usr/share/nginx/html/
+
+# Normaliza CRLF (Git en Windows), fija permisos y deja escribible lo que el
+# arranque necesita: el directorio donde se genera server.conf y /tmp/nginx.
+# Tambien se retiran el entrypoint oficial y conf.d: la configuracion la
+# genera el nuestro, y dejarlos solo invita a anadir ahi otro servidor.
+RUN sed -i 's/\r$//' /usr/local/bin/vpg-frontend-entrypoint.sh /etc/nginx/nginx.conf \
+      /etc/nginx/vpg/snippets/*.conf /etc/nginx/vpg/templates/*.template \
+ && chmod 0755 /usr/local/bin/vpg-frontend-entrypoint.sh \
+ && chmod 0644 /etc/nginx/nginx.conf /etc/nginx/vpg/snippets/*.conf \
+      /etc/nginx/vpg/templates/*.template \
+ && mkdir -p /tmp/nginx \
+ && chown -R nginx:nginx /etc/nginx/vpg /tmp/nginx \
+ && rm -rf /docker-entrypoint.d /etc/nginx/conf.d /docker-entrypoint.sh
+
+USER nginx
+# Puertos NO privilegiados: 8080 (HTTP o redireccion), 8443 (TLS). El 8081 es
+# la escucha interna de salud y no se publica.
+EXPOSE 8080 8443
+# Forma de shell para que FRONTEND_HEALTH_PORT se expanda en ejecucion. Va
+# siempre por HTTP contra la escucha interna: asi un fallo de TLS se ve como un
+# contenedor que no arranca, en vez de taparse con una comprobacion insegura.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=5 \
+  CMD wget --quiet --spider "http://127.0.0.1:${FRONTEND_HEALTH_PORT:-8081}/healthz" || exit 1
+ENTRYPOINT ["/usr/local/bin/vpg-frontend-entrypoint.sh"]

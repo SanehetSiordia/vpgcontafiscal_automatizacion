@@ -13,7 +13,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from app.schemas.user import USERNAME_RE, StrictModel
+from app.schemas.user import USERNAME_RE, StrictModel, TotpStatus
 
 
 class LoginRequest(StrictModel):
@@ -41,7 +41,14 @@ class LoginRequest(StrictModel):
 
 
 class LoginChallenge(BaseModel):
-    """Respuesta del login: hay desafio MFA y **no** hay sesion todavia."""
+    """Respuesta del login: hay desafio MFA y **no** hay sesion todavia.
+
+    ``totp_status`` y ``enrollment_id`` son la ampliacion **aditiva** de la
+    etapa 5.1, y los dos se resuelven *despues* de que Vault valide la
+    contrasena y de comprobar el vinculo del empleado en PostgreSQL. No cambian
+    nada de lo anterior: siguen sin haber sesion, el MFA se sigue exigiendo y
+    los codigos de error son los mismos.
+    """
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -51,6 +58,8 @@ class LoginChallenge(BaseModel):
                 "method_name": "vpg-totp",
                 "expires_in_seconds": 180,
                 "message": "Login incompleto: envia el codigo TOTP a /auth/mfa/verify.",
+                "totp_status": "pending",
+                "enrollment_id": "Rk9t2w-ejemplo",
             }
         }
     )
@@ -60,6 +69,25 @@ class LoginChallenge(BaseModel):
     method_name: str
     expires_in_seconds: int
     message: str
+    totp_status: TotpStatus | None = Field(
+        default=None,
+        description=(
+            "Estado **historico** del enrolamiento, tal como lo registra "
+            "PostgreSQL. 'pending' no demuestra que la persona no tenga su "
+            "autenticador configurado, y 'confirmed' no omite el MFA. Es nulo "
+            "si el empleado no tiene vinculo con Vault registrado."
+        ),
+    )
+    enrollment_id: str | None = Field(
+        default=None,
+        description=(
+            "Autorizacion de un solo uso para inscribir el TOTP **propio** en "
+            "/auth/enrollment/totp. Solo aparece si el estado historico no es "
+            "'confirmed' ni 'disabled'. No es una sesion y no autoriza ninguna "
+            "operacion de negocio. Que exista no garantiza que haya semilla que "
+            "generar: si la entidad ya tiene una, la peticion responde 409."
+        ),
+    )
 
 
 class MfaVerifyRequest(StrictModel):
@@ -108,6 +136,56 @@ class SessionOut(BaseModel):
     entity_id: str
     vault_policies: list[str]
     expires_at: dt.datetime
+
+
+class SelfEnrollmentRequest(StrictModel):
+    """Cuerpo de /auth/enrollment/totp. Solo la autorizacion, nada mas.
+
+    No lleva ``user_id`` ni ``entity_id`` a proposito: los dos salen de la
+    autorizacion emitida en el login, que a su vez sale del vinculo registrado.
+    Recibirlos del cliente convertiria el endpoint en una forma de generar
+    semillas ajenas.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"example": {"enrollment_id": "Rk9t2w-ejemplo"}},
+    )
+
+    enrollment_id: str = Field(min_length=8, max_length=128)
+
+
+class SelfEnrollmentOut(BaseModel):
+    """Inscripcion inicial propia: el **unico** envio de este URI otpauth.
+
+    Se devuelve con ``Cache-Control: no-store``, no se registra y no vuelve a
+    aparecer en ningun GET. Si se pierde, hace falta un reset administrativo
+    explicito: no se regenera en silencio.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "username": "ana.perez",
+                "totp_status": "pending",
+                "totp_enrollment_uri": "otpauth://totp/...",
+                "warning": (
+                    "Este URI se muestra UNA sola vez. Escanealo en Google "
+                    "Authenticator y completa el login con el codigo de 6 digitos."
+                ),
+            }
+        }
+    )
+
+    username: str
+    totp_status: TotpStatus = Field(
+        description=(
+            "Estado historico, **sin cambiar**: generar la semilla no confirma "
+            "nada. La confirmacion la hace el primer login MFA correcto."
+        )
+    )
+    totp_enrollment_uri: str = Field(description="URI otpauth://. Se entrega una sola vez.")
+    warning: str
 
 
 # ---------------------------------------------------------------------------

@@ -24,11 +24,13 @@ from app.schemas.auth import (
     LoginChallenge,
     LoginRequest,
     MfaVerifyRequest,
+    SelfEnrollmentOut,
+    SelfEnrollmentRequest,
     SessionOut,
     StepUpChallengeOut,
 )
 from app.schemas.internal import StepUpBeginRequest, StepUpProofOut, StepUpVerifyRequest
-from app.services.auth import AuthService
+from app.services.auth import SELF_ENROLLMENT_WARNING, AuthService
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -46,7 +48,12 @@ router = APIRouter(prefix="/auth", tags=["auth"])
         "La respuesta **no** autentica: hay que completar `/auth/mfa/verify`. Si "
         "Vault llegara a emitir token en este paso, el login se rechaza con 403 "
         "porque significaria que el MFA no se esta exigiendo.\n\n"
-        "La contrasena no se conserva ni se registra en ningun punto."
+        "La contrasena no se conserva ni se registra en ningun punto.\n\n"
+        "**Etapa 5.1.** La respuesta anade dos campos opcionales, resueltos "
+        "*despues* de que Vault acepte la contrasena: `totp_status`, el estado "
+        "**historico** del enrolamiento, y `enrollment_id`, una autorizacion de "
+        "un solo uso para inscribir el TOTP propio. Ninguno de los dos es una "
+        "sesion ni permite omitir el MFA."
     ),
 )
 async def login(
@@ -56,16 +63,20 @@ async def login(
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> LoginChallenge:
     response.headers["Cache-Control"] = "no-store"
-    challenge = await auth.begin_login(
+    outcome = await auth.begin_login(
         payload.username, payload.password.get_secret_value()
     )
     return LoginChallenge(
-        challenge_id=challenge.challenge_id,
+        challenge_id=outcome.challenge.challenge_id,
         method_name=settings.vault_mfa_method_name,
         expires_in_seconds=settings.challenge_ttl_seconds,
         message=(
             "Login incompleto: todavia no hay sesion. Envia el codigo TOTP a "
             "/auth/mfa/verify antes de que caduque el desafio."
+        ),
+        totp_status=outcome.totp_status,  # type: ignore[arg-type]
+        enrollment_id=(
+            outcome.enrollment.grant_id if outcome.enrollment is not None else None
         ),
     )
 
@@ -103,6 +114,48 @@ async def verify_mfa(
         entity_id=api_session.entity_id,
         vault_policies=list(api_session.vault_policies),
         expires_at=api_session.expires_at,
+    )
+
+
+@router.post(
+    "/enrollment/totp",
+    response_model=SelfEnrollmentOut,
+    status_code=status.HTTP_200_OK,
+    responses=AUTH_ERRORS | {403: COMMON_ERRORS[403], 409: COMMON_ERRORS[409]},
+    dependencies=[Depends(require_ready), Depends(rate_limit_mfa)],
+    summary="Inscripcion inicial del TOTP propio, antes del primer MFA",
+    description=(
+        "Pensado para quien ya esta registrado en PostgreSQL y en Vault pero "
+        "todavia no tiene su autenticador: devuelve el URI `otpauth://` de **su "
+        "propia** entidad para que lo escanee en Google Authenticator.\n\n"
+        "No hay sesion ni cuerpo con identidades: el usuario y la entidad salen "
+        "del `enrollment_id` que emitio `/auth/login` tras validar la contrasena, "
+        "que es de **un solo uso** y caduca con el desafio. Esta autorizacion no "
+        "habilita ninguna operacion administrativa.\n\n"
+        "**Nunca sustituye una semilla existente.** Si la entidad ya tiene una, "
+        "Vault rechaza generar otra y la respuesta es **409**: perder el URI se "
+        "resuelve con un reset explicito de MFA, no regenerando en silencio. Un "
+        "`totp_status` distinto de `confirmed` **no** autoriza por si solo a "
+        "generar ni a reemplazar la semilla.\n\n"
+        "La sesion API sigue entregandose solo en `/auth/mfa/verify`, con el "
+        "codigo validado contra Vault."
+    ),
+)
+async def self_enroll_totp(
+    payload: SelfEnrollmentRequest,
+    response: Response,
+    auth: Annotated[AuthService, Depends(get_auth_service)],
+) -> SelfEnrollmentOut:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    username, totp_status, enrollment_uri = await auth.self_enroll_totp(
+        payload.enrollment_id
+    )
+    return SelfEnrollmentOut(
+        username=username,
+        totp_status=totp_status,  # type: ignore[arg-type]
+        totp_enrollment_uri=enrollment_uri,
+        warning=SELF_ENROLLMENT_WARNING,
     )
 
 

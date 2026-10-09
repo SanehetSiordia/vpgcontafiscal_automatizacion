@@ -1,0 +1,506 @@
+/*
+ * Hoja de estilos unica, externa y sin `@import` de terceros.
+ *
+ * Es externa a proposito: la CSP del runtime es `style-src 'self'` sin
+ * `unsafe-inline`, y esa politica tambien bloquea los atributos `style="..."`.
+ * Por eso en el codigo TSX no hay ni un `style={{ ... }}`: todo pasa por
+ * clases. Las fuentes son las del sistema, asi que `font-src 'self'` basta y no
+ * hay ninguna peticion a un origen externo.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --vpg-azul-900: #0d2338;
+  --vpg-azul-700: #15314b;
+  --vpg-azul-500: #2f6fab;
+  --vpg-azul-300: #7fb2e5;
+  --vpg-fondo: #f4f7fb;
+  --vpg-superficie: #ffffff;
+  --vpg-texto: #15222e;
+  --vpg-texto-suave: #4b5c6b;
+  --vpg-borde: #c9d6e3;
+  --vpg-error-fondo: #fdeaea;
+  --vpg-error-borde: #c0392b;
+  --vpg-error-texto: #7f1d14;
+  --vpg-aviso-fondo: #fff7e6;
+  --vpg-aviso-borde: #b7791f;
+  --vpg-aviso-texto: #6b4708;
+  --vpg-ok-fondo: #eaf6ee;
+  --vpg-ok-borde: #2f855a;
+  --vpg-ok-texto: #1c4f38;
+
+  --vpg-radio: 10px;
+  --vpg-sombra: 0 1px 2px rgb(13 35 56 / 8%), 0 8px 24px rgb(13 35 56 / 8%);
+  --vpg-fuente: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --vpg-mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas,
+    "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --vpg-fondo: #0f1a24;
+    --vpg-superficie: #16242f;
+    --vpg-texto: #e8eef4;
+    --vpg-texto-suave: #a9bac8;
+    --vpg-borde: #2d4150;
+    --vpg-azul-500: #5b9bd8;
+    --vpg-error-fondo: #3a1a17;
+    --vpg-error-borde: #e06a5c;
+    --vpg-error-texto: #ffd9d4;
+    --vpg-aviso-fondo: #3a2e12;
+    --vpg-aviso-borde: #e0b25c;
+    --vpg-aviso-texto: #ffeccd;
+    --vpg-ok-fondo: #13301f;
+    --vpg-ok-borde: #68c08d;
+    --vpg-ok-texto: #d6f5e3;
+    --vpg-sombra: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 24px rgb(0 0 0 / 35%);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--vpg-fondo);
+  color: var(--vpg-texto);
+  font-family: var(--vpg-fuente);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
+}
+
+a {
+  color: var(--vpg-azul-500);
+}
+
+/* --- estructura ---------------------------------------------------------- */
+
+.vpg-app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.vpg-cabecera {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 0.9rem 1.25rem;
+  background: var(--vpg-azul-700);
+  color: #f4f7fb;
+}
+
+.vpg-cabecera__marca {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.vpg-cabecera__nota {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--vpg-azul-300);
+}
+
+.vpg-principal {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 2.5rem;
+}
+
+.vpg-pie {
+  padding: 0.9rem 1rem 1.4rem;
+  text-align: center;
+  font-size: 0.78rem;
+  color: var(--vpg-texto-suave);
+}
+
+.vpg-salto-contenido {
+  position: absolute;
+  left: -9999px;
+}
+
+.vpg-salto-contenido:focus {
+  position: static;
+  display: inline-block;
+  margin: 0.5rem;
+  padding: 0.4rem 0.7rem;
+  background: var(--vpg-superficie);
+  color: var(--vpg-texto);
+  border-radius: var(--vpg-radio);
+}
+
+/* --- tarjetas ------------------------------------------------------------ */
+
+.vpg-tarjeta {
+  background: var(--vpg-superficie);
+  border: 1px solid var(--vpg-borde);
+  border-radius: var(--vpg-radio);
+  box-shadow: var(--vpg-sombra);
+  padding: 1.5rem;
+}
+
+.vpg-tarjeta + .vpg-tarjeta {
+  margin-top: 1.25rem;
+}
+
+.vpg-tarjeta__titulo {
+  margin: 0 0 0.35rem;
+  font-size: 1.3rem;
+  line-height: 1.3;
+}
+
+.vpg-tarjeta__intro {
+  margin: 0 0 1.25rem;
+  color: var(--vpg-texto-suave);
+  font-size: 0.95rem;
+}
+
+/* --- formularios -------------------------------------------------------- */
+
+.vpg-campo {
+  display: block;
+  margin-bottom: 1.1rem;
+}
+
+.vpg-campo__etiqueta {
+  display: block;
+  margin-bottom: 0.3rem;
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+
+.vpg-campo__fila {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+.vpg-campo__ayuda {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.83rem;
+  color: var(--vpg-texto-suave);
+}
+
+.vpg-campo__error {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--vpg-error-borde);
+  font-weight: 600;
+}
+
+input.vpg-entrada {
+  width: 100%;
+  padding: 0.6rem 0.7rem;
+  font: inherit;
+  color: var(--vpg-texto);
+  background: var(--vpg-superficie);
+  border: 1px solid var(--vpg-borde);
+  border-radius: 8px;
+}
+
+input.vpg-entrada:focus-visible,
+button:focus-visible,
+a:focus-visible {
+  outline: 3px solid var(--vpg-azul-500);
+  outline-offset: 2px;
+}
+
+input.vpg-entrada[aria-invalid="true"] {
+  border-color: var(--vpg-error-borde);
+}
+
+input.vpg-entrada:disabled {
+  opacity: 0.65;
+}
+
+input.vpg-codigo {
+  font-family: var(--vpg-mono);
+  font-size: 1.6rem;
+  letter-spacing: 0.4em;
+  text-align: center;
+}
+
+/* --- botones ------------------------------------------------------------ */
+
+.vpg-boton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  padding: 0.55rem 1.1rem;
+  font: inherit;
+  font-weight: 600;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.vpg-boton--primario {
+  width: 100%;
+  background: var(--vpg-azul-700);
+  color: #f4f7fb;
+}
+
+.vpg-boton--primario:hover:not(:disabled) {
+  background: var(--vpg-azul-900);
+}
+
+.vpg-boton--secundario {
+  background: transparent;
+  color: var(--vpg-azul-500);
+  border-color: var(--vpg-borde);
+}
+
+.vpg-boton--peligro {
+  background: var(--vpg-error-borde);
+  color: #fff;
+}
+
+.vpg-boton--sutil {
+  background: transparent;
+  color: var(--vpg-texto-suave);
+  border-color: var(--vpg-borde);
+  min-height: 2.4rem;
+  padding: 0.3rem 0.65rem;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.vpg-boton:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.vpg-acciones {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+/* --- avisos ------------------------------------------------------------- */
+
+.vpg-aviso {
+  margin: 0 0 1.1rem;
+  padding: 0.8rem 0.95rem;
+  border-radius: 8px;
+  border-left: 5px solid;
+  font-size: 0.93rem;
+}
+
+.vpg-aviso p {
+  margin: 0.35rem 0 0;
+}
+
+.vpg-aviso p:first-child {
+  margin-top: 0;
+}
+
+.vpg-aviso--error {
+  background: var(--vpg-error-fondo);
+  border-color: var(--vpg-error-borde);
+  color: var(--vpg-error-texto);
+}
+
+.vpg-aviso--atencion {
+  background: var(--vpg-aviso-fondo);
+  border-color: var(--vpg-aviso-borde);
+  color: var(--vpg-aviso-texto);
+}
+
+.vpg-aviso--info {
+  background: var(--vpg-ok-fondo);
+  border-color: var(--vpg-ok-borde);
+  color: var(--vpg-ok-texto);
+}
+
+.vpg-aviso__titulo {
+  margin: 0 0 0.3rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.vpg-aviso__lista {
+  margin: 0.4rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.vpg-aviso__meta {
+  margin-top: 0.45rem;
+  font-family: var(--vpg-mono);
+  font-size: 0.76rem;
+  opacity: 0.85;
+  word-break: break-all;
+}
+
+/* --- datos de la sesion -------------------------------------------------- */
+
+.vpg-datos {
+  display: grid;
+  grid-template-columns: minmax(8rem, 12rem) 1fr;
+  gap: 0.45rem 1rem;
+  margin: 0;
+  font-size: 0.93rem;
+}
+
+.vpg-datos dt {
+  color: var(--vpg-texto-suave);
+  font-weight: 600;
+}
+
+.vpg-datos dd {
+  margin: 0;
+  word-break: break-word;
+}
+
+.vpg-datos code,
+.vpg-codigo-en-linea {
+  font-family: var(--vpg-mono);
+  font-size: 0.86em;
+}
+
+.vpg-etiquetas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.vpg-etiqueta {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--vpg-borde);
+  border-radius: 999px;
+  font-size: 0.8rem;
+}
+
+/* --- QR de inscripcion --------------------------------------------------- */
+
+.vpg-qr {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1rem 0 0;
+  padding: 1.1rem;
+  background: #ffffff;
+  border: 1px solid var(--vpg-borde);
+  border-radius: var(--vpg-radio);
+}
+
+.vpg-qr__lienzo {
+  /* Margen claro alrededor del codigo: los lectores lo necesitan, y en modo
+     oscuro el fondo del QR debe seguir siendo blanco. */
+  padding: 12px;
+  background: #ffffff;
+  border-radius: 6px;
+}
+
+.vpg-qr__pasos {
+  margin: 0;
+  padding-left: 1.2rem;
+  font-size: 0.9rem;
+  color: #15222e;
+}
+
+.vpg-qr__cuenta {
+  font-size: 0.84rem;
+  color: #4b5c6b;
+}
+
+.vpg-pasos {
+  margin: 0.6rem 0 0;
+  padding-left: 1.2rem;
+  font-size: 0.92rem;
+}
+
+.vpg-separador {
+  margin: 1.4rem 0;
+  border: 0;
+  border-top: 1px solid var(--vpg-borde);
+}
+
+.vpg-detalle {
+  margin-top: 1rem;
+  font-size: 0.9rem;
+}
+
+.vpg-detalle summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.vpg-uri {
+  display: block;
+  margin-top: 0.6rem;
+  padding: 0.6rem;
+  background: var(--vpg-fondo);
+  border: 1px dashed var(--vpg-borde);
+  border-radius: 6px;
+  font-family: var(--vpg-mono);
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+/* --- utilidades --------------------------------------------------------- */
+
+.vpg-oculto-visual {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.vpg-centrado {
+  text-align: center;
+}
+
+.vpg-cargando {
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--vpg-texto-suave);
+}
+
+@media (width <= 32rem) {
+  .vpg-principal {
+    padding: 1rem 1rem 2rem;
+  }
+
+  .vpg-tarjeta {
+    padding: 1.1rem;
+  }
+
+  .vpg-datos {
+    grid-template-columns: 1fr;
+    gap: 0.1rem;
+  }
+
+  .vpg-datos dd {
+    margin-bottom: 0.6rem;
+  }
+}

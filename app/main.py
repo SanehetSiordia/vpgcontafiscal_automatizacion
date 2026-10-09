@@ -59,6 +59,11 @@ HashiCorp Vault.
    de 6 digitos. Devuelve `api_session`.
 3. Pulsa **Authorize** y pega el valor de `api_session`.
 
+Si `/auth/login` devuelve `enrollment_id`, esa identidad todavia no tiene un
+login MFA confirmado y puede pedir **su propio** URI de inscripcion en
+`POST /user_mgmt/v1/auth/enrollment/totp`. Esa autorizacion es de un solo uso,
+no es una sesion y no sustituye al MFA.
+
 El identificador de sesion es opaco. El token de Vault no sale del servidor,
 no se devuelve al cliente y no se guarda en PostgreSQL.
 

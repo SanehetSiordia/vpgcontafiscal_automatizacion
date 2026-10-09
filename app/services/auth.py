@@ -17,13 +17,20 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.core.errors import ForbiddenError, UnauthenticatedError, UpstreamUnavailableError
+from app.core.errors import (
+    ConflictError,
+    ForbiddenError,
+    UnauthenticatedError,
+    UpstreamUnavailableError,
+)
 from app.core.logging import get_logger
 from app.core.security import (
     ApiSession,
+    EnrollmentGrant,
     MfaProof,
     PendingChallenge,
     SessionStore,
@@ -34,6 +41,8 @@ from app.core.vault import (
     VaultError,
     VaultInvalidCredentials,
     VaultMFAFailed,
+    VaultNotFound,
+    VaultPermissionDenied,
     VaultSealed,
     VaultSession,
     VaultUnavailable,
@@ -41,6 +50,32 @@ from app.core.vault import (
 from app.repositories import users as repo
 
 logger = get_logger(__name__)
+
+# Estados historicos desde los que tiene sentido ofrecer la inscripcion inicial
+# del propio TOTP. 'confirmed' queda fuera porque ya hubo un login MFA correcto,
+# y 'disabled' porque no se continua como si el MFA siguiera activo.
+_ENROLLABLE_STATUSES = frozenset({"pending", "reset_required"})
+
+SELF_ENROLLMENT_WARNING = (
+    "Este URI otpauth:// se entrega UNA sola vez y no se registra en ningun log. "
+    "Escanealo en Google Authenticator y termina el login con el codigo de 6 "
+    "digitos. Si se pierde, no se regenera en silencio: hace falta un reset "
+    "explicito de MFA."
+)
+
+
+@dataclass(slots=True, frozen=True)
+class LoginOutcome:
+    """Resultado del paso 1 del login.
+
+    El desafio es lo unico imprescindible; los otros dos campos son la
+    ampliacion de la etapa 5.1 y pueden ser nulos sin que nada deje de
+    funcionar: un cliente que los ignore se comporta igual que antes.
+    """
+
+    challenge: PendingChallenge
+    totp_status: str | None
+    enrollment: EnrollmentGrant | None
 
 
 class AuthService:
@@ -61,7 +96,7 @@ class AuthService:
 
     # -- paso 1 --------------------------------------------------------------
 
-    async def begin_login(self, username: str, password: str) -> PendingChallenge:
+    async def begin_login(self, username: str, password: str) -> LoginOutcome:
         async with self._session_factory() as session:
             identity = await repo.get_vault_identity_by_username(session, username)
             user = await repo.get_by_username(session, username)
@@ -99,12 +134,35 @@ class AuthService:
                 "Vault no devolvio un desafio MFA valido para este usuario"
             )
 
-        return await self._sessions.create_challenge(
+        pending = await self._sessions.create_challenge(
             username=username,
             mfa_request_id=challenge.mfa_request_id,
             method_id=challenge.method_ids[0],
             expected_user_id=user.id if user is not None else None,
             expected_entity_id=str(identity.vault_entity_id) if identity is not None else None,
+        )
+
+        # --- ampliacion de la etapa 5.1 -------------------------------------
+        # El estado historico se devuelve AQUI, no antes: hace falta que Vault
+        # haya aceptado la contrasena y que el vinculo exista en PostgreSQL. No
+        # hay consulta publica por username que lo exponga sin contrasena.
+        totp_status = identity.totp_status if identity is not None else None
+        enrollment: EnrollmentGrant | None = None
+        if (
+            identity is not None
+            and user is not None
+            and user.is_active
+            and totp_status in _ENROLLABLE_STATUSES
+        ):
+            enrollment = await self._sessions.create_enrollment(
+                user_id=user.id,
+                username=user.username,
+                entity_id=str(identity.vault_entity_id),
+                totp_status=identity.totp_status,
+            )
+
+        return LoginOutcome(
+            challenge=pending, totp_status=totp_status, enrollment=enrollment
         )
 
     # -- paso 2 --------------------------------------------------------------
@@ -216,6 +274,104 @@ class AuthService:
             user_id=user.id, username=user.username, vault=vault_session
         )
         return api_session, roles
+
+    # -- inscripcion inicial del propio TOTP (etapa 5.1) ---------------------
+
+    async def self_enroll_totp(self, grant_id: str) -> tuple[str, str, str]:
+        """Genera la semilla TOTP del titular y devuelve su URI otpauth.
+
+        Devuelve ``(username, totp_status, uri)``. El estado es el **historico**
+        y no cambia: generar una semilla no confirma un enrolamiento.
+
+        Lo que decide si se puede generar NO es el estado de PostgreSQL, es
+        Vault: ``admin-generate`` rechaza una entidad que ya tiene semilla, y
+        aqui eso se traduce en 409. El estado solo sirve para no ofrecer esto a
+        quien ya tiene un login MFA confirmado. En ningun caso se destruye una
+        semilla existente: eso es un reset administrativo explicito.
+        """
+        grant = await self._sessions.pop_enrollment(grant_id)
+        if grant is None:
+            raise UnauthenticatedError(
+                "la autorizacion de inscripcion no existe, ya se uso o ha caducado; "
+                "repite el login",
+                code="enrollment_expired",
+            )
+
+        async with self._session_factory() as session:
+            user = await repo.get_by_id(session, grant.user_id)
+            if user is None or not user.is_active:
+                raise ForbiddenError("la cuenta esta desactivada", code="inactive_user")
+
+            identity = await repo.get_vault_identity(session, grant.user_id)
+            if identity is None:
+                raise ForbiddenError(
+                    "el empleado no tiene vinculo con Vault registrado",
+                    code="not_linked",
+                )
+            if str(identity.vault_entity_id) != grant.entity_id:
+                logger.error(
+                    "la entidad del vinculo cambio tras emitir la autorizacion",
+                    extra={"operation": "self_enroll", "target": str(user.id)},
+                )
+                raise ForbiddenError(
+                    "el vinculo del empleado con Vault ha cambiado; repite el login",
+                    code="entity_mismatch",
+                )
+            # Se relee: entre el login y esta peticion pudo haber un login MFA
+            # correcto, un reset o una baja.
+            if identity.totp_status not in _ENROLLABLE_STATUSES:
+                raise ConflictError(
+                    "el estado del segundo factor ya no admite una inscripcion "
+                    f"inicial (estado actual: '{identity.totp_status}')",
+                    code="enrollment_not_allowed",
+                    context={"totp_status": identity.totp_status},
+                )
+            status = identity.totp_status
+            # Se copia dentro de la sesion: fuera, la instancia esta desligada.
+            entity_uuid = identity.vault_entity_id
+
+        try:
+            method_id = await self._vault.totp_method_id()
+            enrollment_uri = await self._vault.generate_totp(method_id, grant.entity_id)
+        except (VaultSealed, VaultUnavailable) as exc:
+            raise UpstreamUnavailableError(f"Vault: {exc.message}") from exc
+        except VaultNotFound as exc:
+            raise UpstreamUnavailableError(
+                f"la configuracion de MFA de Vault no esta completa: {exc.message}"
+            ) from exc
+        except VaultPermissionDenied:
+            # No es un conflicto de estado: es la credencial tecnica. Que la
+            # trate el manejador de VaultError (502), sin disfrazarla de 409.
+            raise
+        except VaultError as exc:
+            raise ConflictError(
+                "esta identidad ya tiene una semilla TOTP registrada en Vault, asi "
+                "que no se genera otra: si perdiste el URI, hace falta un reset "
+                "explicito de MFA hecho por un administrador.",
+                code="totp_already_enrolled",
+                context={"totp_status": status, "vault_detail": exc.message},
+            ) from exc
+
+        async with self._session_factory() as session:
+            await repo.touch_totp_generated(
+                session,
+                user_id=grant.user_id,
+                entity_id=entity_uuid,
+                now=dt.datetime.now(dt.UTC),
+            )
+            await session.commit()
+
+        logger.info(
+            "inscripcion inicial de TOTP propia",
+            extra={
+                "operation": "self_enroll",
+                "actor": grant.username,
+                "target": str(grant.user_id),
+                "status": "ok",
+                "totp_status": status,
+            },
+        )
+        return grant.username, status, enrollment_uri
 
     # -- reautenticacion para operaciones destructivas (etapa 4) -------------
 
